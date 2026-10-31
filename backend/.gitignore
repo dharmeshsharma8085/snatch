@@ -1,0 +1,21 @@
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Python environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Testing
+.pytest_cache/
+.coverage
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
