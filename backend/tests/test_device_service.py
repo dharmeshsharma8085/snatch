@@ -86,12 +86,12 @@ def test_device_registration(test_db):
 
     result = device_service.register_device(
         DeviceCreate(
+            installation_id=uuid4(),
             device_name="Dharmesh Android",
             platform="android",
         ),
         UUID(user.user_id),
     )
-
     assert result.device_name == "Dharmesh Android"
     assert result.platform == "android"
     assert result.status == "offline"
@@ -199,3 +199,83 @@ def test_inactive_device_heartbeat_rejected(test_db):
 
     assert updated_device.status == "offline"
     assert updated_device.last_seen_at is None
+    
+    
+def test_device_deactivation(test_db):
+    user = create_test_user(test_db)
+    device = create_test_device(test_db, user.user_id)
+
+    result = device_service.set_device_active_status(
+        UUID(device.device_id),
+        UUID(user.user_id),
+        False,
+    )
+
+    assert result is not None
+    assert result.is_active is False
+    assert result.status == "offline"
+
+
+def test_device_reactivation(test_db):
+    user = create_test_user(test_db)
+
+    device = create_test_device(
+        test_db,
+        user.user_id,
+        is_active=False,
+        status="offline",
+    )
+
+    result = device_service.set_device_active_status(
+        UUID(device.device_id),
+        UUID(user.user_id),
+        True,
+    )
+
+    assert result is not None
+    assert result.is_active is True
+    assert result.status == "offline"
+    
+def test_duplicate_registration_same_user(test_db):
+    user = create_test_user(test_db)
+    installation_id = uuid4()
+
+    data = DeviceCreate(
+        installation_id=installation_id,
+        device_name="Test Android",
+        platform="android",
+    )
+
+    first = device_service.register_device(
+        data, UUID(user.user_id)
+    )
+
+    second = device_service.register_device(
+        data, UUID(user.user_id)
+    )
+
+    assert first.device_id == second.device_id
+
+
+def test_duplicate_registration_different_user(test_db):
+    user_a = create_test_user(test_db)
+    user_b = create_test_user(test_db)
+
+    installation_id = uuid4()
+
+    data = DeviceCreate(
+        installation_id=installation_id,
+        device_name="Test Android",
+        platform="android",
+    )
+
+    first = device_service.register_device(
+        data, UUID(user_a.user_id)
+    )
+
+    second = device_service.register_device(
+        data, UUID(user_b.user_id)
+    )
+
+    assert first is not None
+    assert second is None

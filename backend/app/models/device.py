@@ -16,6 +16,13 @@ class Device(Base):
         primary_key=True,
         default=lambda: str(uuid4()),
     )
+    
+    installation_id: Mapped[str | None] = mapped_column(
+        String(36),
+        unique=True,
+        nullable=True,
+        index=True,
+    )
 
     user_id: Mapped[str] = mapped_column(
         String(36),

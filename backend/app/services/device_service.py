@@ -2,7 +2,7 @@
 from uuid import UUID, uuid4
 
 from sqlalchemy import select, or_
-
+from sqlalchemy.exc import IntegrityError
 from app.database.database import SessionLocal
 from app.models.device import Device
 from app.schemas.device import DeviceCreate, DeviceResponse
@@ -24,15 +24,30 @@ def to_response(device: Device) -> DeviceResponse:
         created_at=device.created_at,
     )
 
-
 def register_device(
     data: DeviceCreate,
     user_id: UUID,
-) -> DeviceResponse:
+) -> DeviceResponse | None:
 
     with SessionLocal() as db:
+
+        installation_id = str(data.installation_id)
+
+        statement = select(Device).where(
+            Device.installation_id == installation_id
+        )
+
+        existing_device = db.scalar(statement)
+
+        if existing_device is not None:
+            if existing_device.user_id != str(user_id):
+                return None
+
+            return to_response(existing_device)
+
         device = Device(
             device_id=str(uuid4()),
+            installation_id=installation_id,
             user_id=str(user_id),
             device_name=data.device_name,
             platform=data.platform,
@@ -40,11 +55,28 @@ def register_device(
             status="offline",
         )
 
-        db.add(device)
-        db.commit()
-        db.refresh(device)
+        try:
+            db.add(device)
+            db.commit()
+            db.refresh(device)
 
-        return to_response(device)
+            return to_response(device)
+
+        except IntegrityError:
+            db.rollback()
+
+            # Another request may have registered this installation.
+            existing_device = db.scalar(
+                select(Device).where(
+                    Device.installation_id == installation_id
+                )
+            )
+
+            if existing_device is not None:
+                if existing_device.user_id == str(user_id):
+                    return to_response(existing_device)
+
+            return None
 
 
 def get_user_devices(user_id: UUID) -> list[DeviceResponse]:
@@ -142,3 +174,30 @@ def mark_stale_devices_offline(
             db.commit()
 
         return len(stale_devices)
+
+def set_device_active_status(
+    device_id: UUID,
+    user_id: UUID,
+    is_active: bool,
+) -> DeviceResponse | None:
+
+    with SessionLocal() as db:
+        statement = select(Device).where(
+            Device.device_id == str(device_id),
+            Device.user_id == str(user_id),
+        )
+
+        device = db.scalar(statement)
+
+        if device is None:
+            return None
+
+        device.is_active = is_active
+
+        # Reactivated devices must send a fresh heartbeat.
+        device.status = "offline"
+
+        db.commit()
+        db.refresh(device)
+
+        return to_response(device)

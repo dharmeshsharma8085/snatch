@@ -15,6 +15,7 @@ from app.services.device_service import (
     get_user_devices,
     get_device,
     update_device_heartbeat,
+    set_device_active_status,
 )
 
 router = APIRouter(
@@ -32,10 +33,18 @@ def register_new_device(
     data: DeviceCreate,
     current_user: User = Depends(get_current_user),
 ):
-    return register_device(
+    device = register_device(
         data=data,
         user_id=UUID(current_user.user_id),
     )
+
+    if device is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This device installation is already registered to another user",
+        )
+
+    return device
 
 
 @router.get(
@@ -94,3 +103,49 @@ def device_heartbeat(
         )
 
     return heartbeat
+
+
+@router.post(
+    "/{device_id}/deactivate",
+    response_model=DeviceResponse,
+)
+def deactivate_device(
+    device_id: UUID,
+    current_user: User = Depends(get_current_user),
+):
+    device = set_device_active_status(
+        device_id=device_id,
+        user_id=UUID(current_user.user_id),
+        is_active=False,
+    )
+
+    if device is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Device not found",
+        )
+
+    return device
+
+
+@router.post(
+    "/{device_id}/reactivate",
+    response_model=DeviceResponse,
+)
+def reactivate_device(
+    device_id: UUID,
+    current_user: User = Depends(get_current_user),
+):
+    device = set_device_active_status(
+        device_id=device_id,
+        user_id=UUID(current_user.user_id),
+        is_active=True,
+    )
+
+    if device is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Device not found",
+        )
+
+    return device

@@ -5,8 +5,9 @@ from typing import Literal
 from pydantic import BaseModel, Field
 from uuid import UUID
 
-
 class DeviceCreate(BaseModel):
+    installation_id: UUID
+
     device_name: str = Field(
         min_length=2,
         max_length=100,
