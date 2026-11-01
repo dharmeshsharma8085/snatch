@@ -39,6 +39,11 @@ class Device(Base):
         default=True,
         nullable=False,
     )
+    status: Mapped[str] = mapped_column(
+        String(10),
+        default="offline",
+        nullable=False,
+    )
 
     last_seen_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

@@ -1,7 +1,7 @@
 
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from app.database.database import SessionLocal
 from app.models.device import Device
@@ -11,30 +11,15 @@ from datetime import datetime, timezone, timedelta
 from app.schemas.device import DeviceHeartbeatResponse
 
 
+
 def to_response(device: Device) -> DeviceResponse:
-    last_seen = device.last_seen_at
-
-    if last_seen is None:
-        device_status = "offline"
-    else:
-        if last_seen.tzinfo is None:
-            last_seen = last_seen.replace(tzinfo=timezone.utc)
-
-        now = datetime.now(timezone.utc)
-
-        device_status = (
-            "online"
-            if now - last_seen <= timedelta(minutes=5)
-            else "offline"
-        )
-
     return DeviceResponse(
         device_id=UUID(device.device_id),
         user_id=UUID(device.user_id),
         device_name=device.device_name,
         platform=device.platform,
         is_active=device.is_active,
-        status=device_status,
+        status=device.status,
         last_seen_at=device.last_seen_at,
         created_at=device.created_at,
     )
@@ -52,6 +37,7 @@ def register_device(
             device_name=data.device_name,
             platform=data.platform,
             is_active=True,
+            status="offline",
         )
 
         db.add(device)
@@ -94,6 +80,7 @@ def get_device(
 
 
 
+
 def update_device_heartbeat(
     device_id: UUID,
     user_id: UUID,
@@ -114,6 +101,7 @@ def update_device_heartbeat(
         now = datetime.now(timezone.utc)
 
         device.last_seen_at = now
+        device.status = "online"
 
         db.commit()
         db.refresh(device)
@@ -121,6 +109,36 @@ def update_device_heartbeat(
         return DeviceHeartbeatResponse(
             device_id=UUID(device.device_id),
             status="online",
-            last_seen_at=device.last_seen_at,
+            last_seen_at=now,
             message="Device heartbeat received successfully",
         )
+
+
+
+
+def mark_stale_devices_offline(
+    timeout_minutes: int = 5,
+) -> int:
+    cutoff_time = datetime.now(timezone.utc) - timedelta(
+        minutes=timeout_minutes
+    )
+
+    with SessionLocal() as db:
+        statement = select(Device).where(
+            Device.is_active.is_(True),
+            Device.status == "online",
+            or_(
+                Device.last_seen_at.is_(None),
+                Device.last_seen_at < cutoff_time,
+            ),
+        )
+
+        stale_devices = db.scalars(statement).all()
+
+        for device in stale_devices:
+            device.status = "offline"
+
+        if stale_devices:
+            db.commit()
+
+        return len(stale_devices)

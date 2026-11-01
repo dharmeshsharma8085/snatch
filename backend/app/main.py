@@ -1,23 +1,54 @@
-from app.api.evidence import router as evidence_router
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
+
+from app.api.evidence import router as evidence_router
 from app.api.emergency import router as emergency_router
-from app.core.config import settings
 from app.api.battery import router as battery_router
 from app.api.workflow import router as workflow_router
 from app.api.incidents import router as incidents_router
+from app.api.devices import router as devices_router
+from app.api.auth import router as auth_router
+
+from app.core.config import settings
+
 from app.schemas.events import (
     DeviceEvent,
     AnalysisResponse,
     RiskAssessmentResponse
 )
 
-from app.api.devices import router as devices_router
-
-
-
-
 from app.graph.workflow import snatch_graph
-from app.api.auth import router as auth_router
+from app.workers.device_monitor import device_monitor_loop
+
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    # Start background device monitoring
+    monitor_task = asyncio.create_task(
+        device_monitor_loop()
+    )
+
+    logger.info("SNATCH Device Monitor Started")
+
+    try:
+        yield
+
+    finally:
+        # Stop monitoring safely during shutdown
+        monitor_task.cancel()
+
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            logger.info("SNATCH Device Monitor Stopped")
+
 
 app = FastAPI(
     title=settings.app_name,
@@ -25,19 +56,19 @@ app = FastAPI(
         "Agentic smartphone protection "
         "and emergency response platform"
     ),
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan
 )
 
-app.include_router(evidence_router)
 
+# Register API routers
+app.include_router(evidence_router)
 app.include_router(emergency_router)
 app.include_router(battery_router)
 app.include_router(workflow_router)
 app.include_router(incidents_router)
 app.include_router(auth_router)
 app.include_router(devices_router)
-
-
 
 
 @app.get("/")

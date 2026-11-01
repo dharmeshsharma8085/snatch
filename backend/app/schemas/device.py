@@ -25,9 +25,9 @@ class DeviceResponse(BaseModel):
     device_name: str
     platform: str
     is_active: bool
+    status: Literal["online", "offline"]
     last_seen_at: datetime | None
     created_at: datetime
-
 
 class DeviceHeartbeatResponse(BaseModel):
     device_id: UUID
