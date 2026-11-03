@@ -1,8 +1,10 @@
 from app.database.database import Base, engine
-from app.models.device import Device
+
 # Import all models
-from app.models.incident import Incident
 from app.models.user import User
+from app.models.device import Device
+from app.models.incident import Incident
+from app.models.location import DeviceLocation
 
 
 def create_tables():
