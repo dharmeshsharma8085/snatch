@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-
+from app.api.location import router as location_router
 from app.api.evidence import router as evidence_router
 from app.api.emergency import router as emergency_router
 from app.api.battery import router as battery_router
@@ -69,7 +69,7 @@ app.include_router(workflow_router)
 app.include_router(incidents_router)
 app.include_router(auth_router)
 app.include_router(devices_router)
-
+app.include_router(location_router)
 
 @app.get("/")
 async def root():

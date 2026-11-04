@@ -1,24 +1,26 @@
 from datetime import datetime, timezone, timedelta
 from uuid import UUID
 
-from app.schemas.location import (
-    LocationUpdate,
-    LocationResponse
-)
+from sqlalchemy import select
 
+from app.database.database import SessionLocal
+from app.models.device import Device
+from app.models.location import DeviceLocation
+from app.schemas.location import LocationUpdate, LocationResponse
 
-# Prototype storage: data server restart hone par clear ho jayega.
-LAST_KNOWN_LOCATIONS: dict[UUID, LocationResponse] = {}
 
 STALE_AFTER_MINUTES = 15
 MAX_FUTURE_MINUTES = 5
 
 
 def process_location_update(
-    location: LocationUpdate
+    location: LocationUpdate,
 ) -> LocationResponse:
+    """
+    Validate location data.
+    Used by LangGraph and does not write to the database.
+    """
 
-    # 1. Check user consent
     if not location.consent_granted:
         raise PermissionError(
             "Location access requires user consent."
@@ -27,7 +29,6 @@ def process_location_update(
     now = datetime.now(timezone.utc)
     captured_at = location.captured_at
 
-    # 2. Reject timestamps too far in the future
     if captured_at > now + timedelta(
         minutes=MAX_FUTURE_MINUTES
     ):
@@ -35,7 +36,6 @@ def process_location_update(
             "Location timestamp cannot be in the future."
         )
 
-    # 3. Check whether location is stale
     age = now - captured_at
 
     if age > timedelta(minutes=STALE_AFTER_MINUTES):
@@ -45,25 +45,102 @@ def process_location_update(
         status = "fresh"
         message = "Location received successfully."
 
-    # 4. Build response
-    response = LocationResponse(
+    return LocationResponse(
         device_id=location.device_id,
         latitude=location.latitude,
         longitude=location.longitude,
         accuracy_m=location.accuracy_m,
-        captured_at=captured_at,
+        captured_at=location.captured_at,
         status=status,
-        message=message
+        message=message,
     )
 
-    # 5. Save last-known location
-    LAST_KNOWN_LOCATIONS[location.device_id] = response
 
-    return response
+def save_location_update(
+    location: LocationUpdate,
+    user_id: UUID,
+) -> LocationResponse | None:
+    """
+    Validate ownership and persist an authorized device location.
+
+    Returns None if the device does not belong to the user
+    or is inactive.
+    """
+
+    result = process_location_update(location)
+
+    with SessionLocal() as db:
+
+        device = db.scalar(
+            select(Device).where(
+                Device.device_id == str(location.device_id),
+                Device.user_id == str(user_id),
+                Device.is_active.is_(True),
+            )
+        )
+
+        if device is None:
+            return None
+
+        record = DeviceLocation(
+            device_id=str(location.device_id),
+            latitude=location.latitude,
+            longitude=location.longitude,
+            accuracy_m=location.accuracy_m,
+            captured_at=location.captured_at,
+            status=result.status,
+        )
+
+        db.add(record)
+        db.commit()
+
+    return result
 
 
 def get_last_known_location(
-    device_id: UUID
+    device_id: UUID,
+    user_id: UUID,
 ) -> LocationResponse | None:
+    """
+    Retrieve the latest stored location belonging to this user.
+    """
 
-    return LAST_KNOWN_LOCATIONS.get(device_id)
+    with SessionLocal() as db:
+
+        statement = (
+            select(DeviceLocation)
+            .join(
+                Device,
+                DeviceLocation.device_id == Device.device_id,
+            )
+            .where(
+                DeviceLocation.device_id == str(device_id),
+                Device.user_id == str(user_id),
+            )
+            .order_by(
+                DeviceLocation.captured_at.desc(),
+                DeviceLocation.received_at.desc(),
+            )
+            .limit(1)
+        )
+
+        record = db.scalar(statement)
+
+        if record is None:
+            return None
+
+        message = (
+            "Location received successfully."
+            if record.status == "fresh"
+            else "Location received, but it may be outdated."
+        )
+
+        return LocationResponse(
+            device_id=UUID(record.device_id),
+            latitude=record.latitude,
+            longitude=record.longitude,
+            accuracy_m=record.accuracy_m,
+            captured_at=record.captured_at,
+            status=record.status,
+            message=message,
+        )
