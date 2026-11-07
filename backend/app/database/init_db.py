@@ -5,7 +5,7 @@ from app.models.user import User
 from app.models.device import Device
 from app.models.incident import Incident
 from app.models.location import DeviceLocation
-
+from app.models.evidence import Evidence
 
 def create_tables():
     Base.metadata.create_all(bind=engine)
