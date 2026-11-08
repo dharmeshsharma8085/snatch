@@ -9,7 +9,7 @@ from app.models.location import DeviceLocation
 from app.models.evidence import Evidence
 from app.models.emergency import Emergency
 from app.models.trusted_contact import TrustedContact
-
+from app.models.notification import NotificationDelivery
 
 
 

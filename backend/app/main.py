@@ -23,7 +23,7 @@ from app.schemas.events import (
 from app.graph.workflow import snatch_graph
 from app.workers.device_monitor import device_monitor_loop
 from app.api.trusted_contacts import router as trusted_contacts_router
-
+from app.api.notifications import router as notifications_router
 
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,9 @@ app.include_router(auth_router)
 app.include_router(devices_router)
 app.include_router(location_router)
 app.include_router(trusted_contacts_router)
+app.include_router(notifications_router)
+
+
 
 @app.get("/")
 async def root():
