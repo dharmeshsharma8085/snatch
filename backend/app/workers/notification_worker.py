@@ -1,15 +1,16 @@
+
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import select
 
 from app.database.database import SessionLocal
-
-from app.models.user import User
-from app.models.device import Device
-from app.models.incident import Incident
 from app.models.emergency import Emergency
 from app.models.trusted_contact import TrustedContact
 from app.models.notification import NotificationDelivery
+from app.services.sms_provider import get_sms_provider
+from app.core.config import settings
+
+
 MAX_ATTEMPTS = 3
 
 RETRY_DELAYS = {
@@ -18,9 +19,23 @@ RETRY_DELAYS = {
     3: 120,
 }
 
-
 def process_notification_queue():
+
+    if not settings.sms_live_enabled:
+        return {
+            "processed_count": 0,
+            "sent_count": 0,
+            "failed_count": 0,
+            "max_attempts": MAX_ATTEMPTS,
+            "skipped": True,
+            "message": "SMS is disabled. Notification queue remains untouched.",
+        }
+
     processed_count = 0
+    sent_count = 0
+    failed_count = 0
+
+    provider = get_sms_provider()
 
     with SessionLocal() as db:
         now = datetime.now(timezone.utc)
@@ -39,23 +54,76 @@ def process_notification_queue():
         ).all()
 
         for notification in notifications:
-            notification.attempt_count += 1
-            notification.last_error = (
-                "SMS provider not configured. No real notification was sent."
+            emergency = db.get(
+                Emergency, notification.emergency_id
             )
 
-            if notification.attempt_count >= MAX_ATTEMPTS:
-                notification.status = "failed"
-                notification.next_attempt_at = None
-            else:
-                delay = RETRY_DELAYS[notification.attempt_count]
+            if (
+                emergency is None
+                or not emergency.owner_approved
+                or emergency.status != "approved_pending_delivery"
+                or emergency.delivery_status not in ("queued", "ready")
+            ):
+                continue
 
-                notification.status = "queued"
-                notification.next_attempt_at = (
-                    now + timedelta(seconds=delay)
+            contact = db.get(
+                TrustedContact, notification.contact_id
+            )
+
+            if (
+                contact is None
+                or not contact.is_active
+                or contact.user_id != emergency.user_id
+                or contact.contact_id not in (
+                    emergency.trusted_contact_ids or []
+                )
+            ):
+                notification.status = "failed"
+                notification.last_error = (
+                    "Recipient validation failed. SMS not sent."
+                )
+                notification.next_attempt_at = None
+                failed_count += 1
+                processed_count += 1
+                continue
+
+            message = (
+                "SNATCH emergency alert: The device owner has "
+                "approved this notification. Please contact the "
+                "owner directly. This alert does not confirm theft."
+            )
+
+            result = provider.send_sms(
+                phone_number=contact.phone_number,
+                message=message,
+            )
+
+            notification.attempt_count += 1
+            processed_count += 1
+
+            if result.success:
+                notification.status = "sent"
+                notification.last_error = None
+                notification.next_attempt_at = None
+                sent_count += 1
+
+            else:
+                notification.last_error = (
+                    result.error or "SMS provider request failed."
                 )
 
-            processed_count += 1
+                if notification.attempt_count >= MAX_ATTEMPTS:
+                    notification.status = "failed"
+                    notification.next_attempt_at = None
+                    failed_count += 1
+                else:
+                    delay = RETRY_DELAYS[
+                        notification.attempt_count
+                    ]
+                    notification.status = "queued"
+                    notification.next_attempt_at = (
+                        now + timedelta(seconds=delay)
+                    )
 
         db.flush()
 
@@ -76,16 +144,33 @@ def process_notification_queue():
             ).all()
 
             if deliveries and all(
+                item.status == "sent" for item in deliveries
+            ):
+                emergency.delivery_status = "sent"
+
+            elif deliveries and all(
                 item.status == "failed" for item in deliveries
             ):
                 emergency.delivery_status = "failed"
-            else:
+
+            elif any(
+                item.status == "sent" for item in deliveries
+            ) and any(
+                item.status == "failed" for item in deliveries
+            ):
+                emergency.delivery_status = "partially_failed"
+
+            elif any(
+                item.status == "queued" for item in deliveries
+            ):
                 emergency.delivery_status = "queued"
 
         db.commit()
 
     return {
         "processed_count": processed_count,
+        "sent_count": sent_count,
+        "failed_count": failed_count,
         "max_attempts": MAX_ATTEMPTS,
-        "message": "Queue processing completed. No real SMS was sent.",
+        "message": "Notification queue processing completed.",
     }

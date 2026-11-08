@@ -24,10 +24,9 @@ from app.graph.workflow import snatch_graph
 from app.workers.device_monitor import device_monitor_loop
 from app.api.trusted_contacts import router as trusted_contacts_router
 from app.api.notifications import router as notifications_router
-
-
+from app.workers.notification_runner import notification_worker_loop
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -39,18 +38,37 @@ async def lifespan(app: FastAPI):
 
     logger.info("SNATCH Device Monitor Started")
 
+    # Start notification worker
+    notification_stop_event = asyncio.Event()
+
+    notification_task = asyncio.create_task(
+        notification_worker_loop(
+            notification_stop_event,
+            poll_interval_seconds=15,
+        )
+    )
+
+    logger.info("SNATCH Notification Worker Started")
+
     try:
         yield
 
     finally:
-        # Stop monitoring safely during shutdown
+        # Stop notification worker gracefully
+        notification_stop_event.set()
+
+        try:
+            await notification_task
+        except asyncio.CancelledError:
+            logger.info("SNATCH Notification Worker Stopped")
+
+        # Stop device monitoring
         monitor_task.cancel()
 
         try:
             await monitor_task
         except asyncio.CancelledError:
             logger.info("SNATCH Device Monitor Stopped")
-
 
 app = FastAPI(
     title=settings.app_name,

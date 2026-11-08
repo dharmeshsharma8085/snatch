@@ -6,7 +6,10 @@ class Settings(BaseSettings):
     app_name: str = "SNATCH"
     app_env: str = "development"
     debug: bool = True
-
+    vonage_api_key: str = ""
+    vonage_api_secret: str = ""
+    vonage_sender_id: str = "SNATCH"
+    sms_live_enabled: bool = False
     openai_api_key: str | None = None
     openai_model: str | None = None
 
