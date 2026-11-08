@@ -22,6 +22,8 @@ from app.schemas.events import (
 
 from app.graph.workflow import snatch_graph
 from app.workers.device_monitor import device_monitor_loop
+from app.api.trusted_contacts import router as trusted_contacts_router
+
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,7 @@ app = FastAPI(
 
 
 # Register API routers
+# Register API routers
 app.include_router(evidence_router)
 app.include_router(emergency_router)
 app.include_router(battery_router)
@@ -70,6 +73,7 @@ app.include_router(incidents_router)
 app.include_router(auth_router)
 app.include_router(devices_router)
 app.include_router(location_router)
+app.include_router(trusted_contacts_router)
 
 @app.get("/")
 async def root():
