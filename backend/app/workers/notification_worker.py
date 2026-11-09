@@ -101,11 +101,22 @@ def process_notification_queue():
             notification.attempt_count += 1
             processed_count += 1
 
-            if result.success:
-                notification.status = "sent"
+            if result.success and result.provider_message_id:
+                notification.status = "submitted"
+                notification.provider_message_id = result.provider_message_id
+                notification.provider_status = "accepted"
                 notification.last_error = None
                 notification.next_attempt_at = None
                 sent_count += 1
+
+            elif result.success:
+                notification.status = "failed"
+                notification.provider_status = "unknown"
+                notification.last_error = (
+                    "Provider accepted the request without returning a message ID."
+                )
+                notification.next_attempt_at = None
+                failed_count += 1
 
             else:
                 notification.last_error = (
@@ -125,6 +136,7 @@ def process_notification_queue():
                         now + timedelta(seconds=delay)
                     )
 
+        
         db.flush()
 
         emergency_ids = {
@@ -153,19 +165,23 @@ def process_notification_queue():
             ):
                 emergency.delivery_status = "failed"
 
-            elif any(
-                item.status == "sent" for item in deliveries
-            ) and any(
-                item.status == "failed" for item in deliveries
+            elif (
+                any(item.status == "sent" for item in deliveries)
+                or any(item.status == "failed" for item in deliveries)
+            ) and all(
+                item.status in ("sent", "failed")
+                for item in deliveries
             ):
                 emergency.delivery_status = "partially_failed"
 
             elif any(
-                item.status == "queued" for item in deliveries
+                item.status in ("queued", "submitted")
+                for item in deliveries
             ):
                 emergency.delivery_status = "queued"
 
         db.commit()
+
 
     return {
         "processed_count": processed_count,

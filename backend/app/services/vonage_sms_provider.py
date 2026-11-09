@@ -69,7 +69,6 @@ class VonageSMSProvider:
                     success=True,
                     provider_message_id=result.get("message_id"),
                 )
-
             return SMSResult(
                 success=False,
                 error=result.get(
