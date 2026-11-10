@@ -65,6 +65,21 @@ class NotificationDelivery(Base):
         Text,
         nullable=True,
     )
+    
+    claimed_by: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     provider_message_id: Mapped[str | None] = mapped_column(
         String(100),
@@ -107,5 +122,10 @@ class NotificationDelivery(Base):
             "ix_notification_status_next_attempt",
             "status",
             "next_attempt_at",
+        ),
+        Index(
+            "ix_notification_claim_expiry",
+            "status",
+            "claim_expires_at",
         ),
     )
