@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     sms_live_enabled: bool = False
     openai_api_key: str | None = None
     openai_model: str | None = None
-
+    vonage_signature_secret: str = ""
     api_version: str = "v1"
 
     model_config = SettingsConfigDict(

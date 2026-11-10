@@ -4,7 +4,11 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from app.graph.workflow import snatch_graph
-
+from app.models.user import User
+from app.models.device import Device
+from app.models.incident import Incident
+from app.models.trusted_contact import TrustedContact
+from app.services import emergency_service
 
 def test_multi_agent_battery_workflow():
 
@@ -61,17 +65,67 @@ def test_multi_agent_battery_workflow():
     )
 
 
-
-def test_all_specialists_workflow():
-
+def test_all_specialists_workflow(test_db, monkeypatch):
     device_id = str(uuid4())
     incident_id = str(uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    user_id = str(uuid4())
+    contact_id = str(uuid4())
+
+    monkeypatch.setattr(
+        emergency_service,
+        "SessionLocal",
+        test_db
+    )
+
+    with test_db() as db:
+        user = User(
+            user_id=user_id,
+            email=f"{user_id}@test.com",
+            password_hash="test-hash",
+            is_active=True,
+        )
+
+        device = Device(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="Workflow Test Device",
+            platform="android",
+            is_active=True,
+        )
+
+        incident = Incident(
+            incident_id=incident_id,
+            user_id=user_id,
+            device_id=device_id,
+            risk_score=95,
+            risk_level="critical",
+            trigger_reason="Simulated suspicious activity",
+            signals=[
+                "unusual_motion",
+                "connectivity_loss",
+                "charger_disconnected",
+                "location_anomaly",
+                "user_reported_theft",
+            ],
+            status="awaiting_owner_verification",
+        )
+
+        contact = TrustedContact(
+            contact_id=contact_id,
+            user_id=user_id,
+            name="Test Contact",
+            phone_number="+919876543210",
+            is_active=True,
+        )
+
+        db.add_all([user, device, incident, contact])
+        db.commit()
 
     initial_state = {
         "event": {
             "event_id": str(uuid4()),
-            "user_id": str(uuid4()),
+            "user_id": user_id,
             "device_id": device_id,
             "platform": "simulator",
             "event_type": "suspicious_activity",
@@ -118,9 +172,9 @@ def test_all_specialists_workflow():
             "device_id": device_id,
             "trigger_reason": "Simulated emergency test",
             "trusted_contact_ids": [
-                str(uuid4())
+                contact_id
             ],
-            "owner_approved": True
+
         },
 
         "incident_id": incident_id,
@@ -140,8 +194,8 @@ def test_all_specialists_workflow():
 
     assert len(result["evidence_records"]) == 1
 
-    assert result["emergency_status"]["status"] == "approved_pending_delivery"
-
+    assert result["emergency_status"]["status"] == "pending_owner_approval"
+    assert result["emergency_status"]["owner_approved"] is False
     expected_agents = [
         "Battery Guardian Agent",
         "Location Intelligence Agent",

@@ -1,4 +1,4 @@
-
+from uuid import UUID
 from app.graph.state import SnatchState
 
 from app.services.battery_service import (
@@ -137,12 +137,15 @@ def evidence_manager_node(state: SnatchState) -> dict:
         }
 
 
+
+
 def emergency_response_node(state: SnatchState) -> dict:
 
     trace = list(state.get("agent_trace", []))
     errors = list(state.get("errors", []))
 
     emergency_data = state.get("emergency_data")
+    event = state.get("event") or {}
 
     if not emergency_data:
         return {
@@ -150,8 +153,17 @@ def emergency_response_node(state: SnatchState) -> dict:
         }
 
     try:
+        user_id = event.get("user_id")
+
+        if not user_id:
+            raise ValueError("User ID is missing from workflow event.")
+
         request = EmergencyRequest.model_validate(emergency_data)
-        result = process_emergency(request)
+
+        result = process_emergency(
+            request=request,
+            user_id=UUID(str(user_id))
+        )
 
         trace.append("Emergency Response Agent")
 
