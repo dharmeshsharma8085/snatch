@@ -1,8 +1,13 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Depends
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
+from app.core.security import get_current_user
+from app.models.user import User
+from app.services.device_service import get_device
+
 from app.api.location import router as location_router
 from app.api.evidence import router as evidence_router
 from app.api.emergency import router as emergency_router
@@ -120,47 +125,64 @@ async def health():
     response_model=AnalysisResponse
 )
 async def analyze_device_event(
-    event: DeviceEvent
+    event: DeviceEvent,
+    current_user: User = Depends(get_current_user),
 ):
+    # 1. Verify device ownership and active status.
+    authenticated_user_id = UUID(str(current_user.user_id))
+
+    device = get_device(
+        device_id=event.device_id,
+        user_id=authenticated_user_id,
+    )
+
+    if device is None or not device.is_active:
+        raise HTTPException(
+            status_code=404,
+            detail="Active device not found",
+        )
+
+    # 2. Verify registered platform.
+    if device.platform != event.platform:
+        raise HTTPException(
+            status_code=409,
+            detail="Device platform mismatch",
+        )
+
+    # 3. Never trust user_id from request body.
+    event_data = event.model_dump(mode="json")
+    event_data["user_id"] = str(authenticated_user_id)
 
     try:
-
         initial_state = {
-            "event": event.model_dump(mode="json"),
+            "event": event_data,
             "agent_trace": [],
-            "errors": []
+            "errors": [],
         }
 
-        result = await snatch_graph.ainvoke(
-            initial_state
-        )
+        result = await snatch_graph.ainvoke(initial_state)
 
         assessment = result["risk_assessment"]
 
         return AnalysisResponse(
             event_id=event.event_id,
-
             risk_assessment=RiskAssessmentResponse(
                 score=assessment["score"],
                 level=assessment["level"],
                 confidence=assessment["confidence"],
                 signals=assessment["signals"],
                 explanation=result["explanation"],
-                recommended_action=(
-                    assessment["recommended_action"]
-                )
+                recommended_action=assessment["recommended_action"],
             ),
-
             next_action=result["next_action"],
-
             agent_trace=result["agent_trace"],
-
-            openai_used=result.get("openai_used", False)
+            openai_used=result.get("openai_used", False),
         )
 
     except Exception as error:
+        logger.exception("Legacy analysis workflow failed")
 
         raise HTTPException(
             status_code=500,
-            detail=f"SNATCH workflow failed: {str(error)}"
-        )
+            detail="SNATCH workflow execution failed",
+        ) from error
