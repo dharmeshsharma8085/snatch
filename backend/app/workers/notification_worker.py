@@ -340,4 +340,3 @@ def process_notification_queue():
         "max_attempts": MAX_ATTEMPTS,
         "message": "Notification queue processing completed.",
     }
-  

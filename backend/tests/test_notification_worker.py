@@ -374,3 +374,76 @@ def test_claim_notifications_only_claims_eligible_jobs(
     claimed_ids = notification_worker.claim_notifications()
 
     assert delivery_id not in claimed_ids
+
+
+
+
+def test_expired_claim_becomes_delivery_unknown(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, emergency_id = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    with test_db() as db:
+        notification = db.get(NotificationDelivery, delivery_id)
+        notification.status = "processing"
+        notification.claimed_by = "crashed-worker"
+        notification.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        notification.claim_expires_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        db.commit()
+
+    recovered = notification_worker.recover_expired_claims()
+
+    assert recovered == 1
+
+    with test_db() as db:
+        notification = db.get(NotificationDelivery, delivery_id)
+        emergency = db.get(Emergency, emergency_id)
+
+        assert notification.status == "delivery_unknown"
+        assert notification.claimed_by is None
+        assert notification.claim_expires_at is None
+        assert emergency.delivery_status == "delivery_unknown"
+
+
+def test_unknown_provider_outcome_is_not_retried(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    fake_provider = FakeSMSProvider(
+        SMSResult(
+            success=False,
+            error="Network outcome unknown",
+            outcome_unknown=True,
+        )
+    )
+
+    monkeypatch.setattr(
+        notification_worker,
+        "get_sms_provider",
+        lambda: fake_provider,
+    )
+
+    first_result = notification_worker.process_notification_queue()
+
+    assert first_result["unknown_count"] == 1
+    assert len(fake_provider.calls) == 1
+
+    second_result = notification_worker.process_notification_queue()
+
+    assert second_result["processed_count"] == 0
+    assert len(fake_provider.calls) == 1
+
+    with test_db() as db:
+        notification = db.get(NotificationDelivery, delivery_id)
+
+        assert notification.status == "delivery_unknown"
+        assert notification.next_attempt_at is None
