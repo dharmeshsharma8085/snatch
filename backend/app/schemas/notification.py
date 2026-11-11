@@ -10,12 +10,13 @@ class NotificationDeliveryItem(BaseModel):
     delivery_id: UUID
     contact_id: UUID
     channel: str
-
     status: Literal[
         "queued",
+        "processing",
         "submitted",
         "sent",
-        "failed"
+        "failed",
+        "delivery_unknown",
     ]
 
     attempt_count: int = Field(ge=0)
@@ -40,7 +41,8 @@ class EmergencyNotificationStatusResponse(BaseModel):
         "queued",
         "sent",
         "partially_failed",
-        "failed"
+        "failed",
+        "delivery_unknown",
     ]
 
     recipient_count: int = Field(ge=0)

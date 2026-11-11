@@ -1,5 +1,4 @@
-
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
 from app.models.user import User
@@ -316,3 +315,62 @@ def test_worker_rejects_inactive_contact(
         assert saved.status == "failed"
         assert "Recipient validation failed" in saved.last_error
         assert emergency.delivery_status == "failed"
+
+def test_claim_notifications_sets_processing_and_lease(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    claimed_ids = notification_worker.claim_notifications()
+
+    assert delivery_id in claimed_ids
+
+    with test_db() as db:
+        saved = db.get(NotificationDelivery, delivery_id)
+
+        assert saved.status == "processing"
+        assert saved.claimed_by is not None
+        assert saved.claimed_at is not None
+        assert saved.claim_expires_at is not None
+
+
+def test_claim_notifications_does_not_claim_same_job_twice(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    first_claim = notification_worker.claim_notifications()
+    second_claim = notification_worker.claim_notifications()
+
+    assert delivery_id in first_claim
+    assert delivery_id not in second_claim
+
+
+def test_claim_notifications_only_claims_eligible_jobs(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    with test_db() as db:
+        notification = db.get(NotificationDelivery, delivery_id)
+        notification.next_attempt_at = (
+            datetime.now(timezone.utc)
+            + timedelta(minutes=10)
+        )
+        db.commit()
+
+    claimed_ids = notification_worker.claim_notifications()
+
+    assert delivery_id not in claimed_ids

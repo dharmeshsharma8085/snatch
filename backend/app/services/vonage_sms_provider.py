@@ -40,47 +40,81 @@ class VonageSMSProvider:
         )
     
     
-    
+
     def send_sms(
         self,
         phone_number: str,
         message: str,
     ) -> SMSResult:
+
+        # Validation happens before contacting Vonage.
         try:
             sms = self.build_message(phone_number, message)
-            response = self.client.sms.send(sms)
-
-            response_data = response.model_dump(
-                exclude_unset=True
+        except ValueError as error:
+            return SMSResult(
+                success=False,
+                error=str(error),
             )
 
+        # Once the network request starts, an exception
+        # may mean Vonage accepted the SMS but the response
+        # was lost. Treat it as an unknown outcome.
+        try:
+            response = self.client.sms.send(sms)
+        except Exception as error:
+            logger.error(
+                "Vonage request outcome unknown. Exception type: %s",
+                type(error).__name__,
+            )
+            return SMSResult(
+                success=False,
+                error="Vonage request outcome is unknown. Manual reconciliation required.",
+                outcome_unknown=True,
+            )
+
+        try:
+            response_data = response.model_dump(exclude_unset=True)
             messages = response_data.get("messages", [])
 
             if not messages:
                 return SMSResult(
                     success=False,
-                    error="Vonage returned an empty response.",
+                    error="Vonage returned an empty response. Outcome unknown.",
+                    outcome_unknown=True,
                 )
 
             result = messages[0]
 
             if str(result.get("status")) == "0":
+                message_id = result.get("message_id")
+
+                if not message_id:
+                    return SMSResult(
+                        success=False,
+                        error="Vonage accepted the request without a message ID.",
+                        outcome_unknown=True,
+                    )
+
                 return SMSResult(
                     success=True,
-                    provider_message_id=result.get("message_id"),
+                    provider_message_id=message_id,
                 )
+
             return SMSResult(
                 success=False,
                 error=result.get(
                     "error_text",
-                    "SMS delivery was not accepted by Vonage.",
+                    "Vonage rejected the SMS request.",
                 ),
             )
 
-        except Exception:
-            logger.exception("Vonage SMS request failed.")
-
+        except Exception as error:
+            logger.error(
+                "Vonage response could not be processed. Exception type: %s",
+                type(error).__name__,
+            )
             return SMSResult(
                 success=False,
-                error="Vonage SMS request failed.",
+                error="Vonage response could not be verified. Outcome unknown.",
+                outcome_unknown=True,
             )

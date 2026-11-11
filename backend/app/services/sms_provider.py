@@ -8,7 +8,7 @@ class SMSResult:
     success: bool
     provider_message_id: str | None = None
     error: str | None = None
-
+    outcome_unknown: bool = False
 
 class SMSProvider(Protocol):
     def send_sms(self, phone_number: str, message: str) -> SMSResult:
