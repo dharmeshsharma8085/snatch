@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy import select
-
+from app.models.device import Device
 from app.database.database import SessionLocal
 from app.models.incident import Incident
 from app.schemas.incident import IncidentCreate, IncidentResponse
@@ -30,6 +30,20 @@ def create_incident(
 ) -> IncidentResponse:
 
     with SessionLocal() as db:
+
+        device = db.scalar(
+            select(Device).where(
+                Device.device_id == str(data.device_id),
+                Device.user_id == str(user_id),
+                Device.is_active.is_(True),
+            )
+        )
+
+        if device is None:
+            raise PermissionError(
+                "Active device not found for this user."
+            )
+
         incident = Incident(
             user_id=str(user_id),
             device_id=str(data.device_id),
@@ -51,6 +65,7 @@ def create_incident(
             db.rollback()
             raise
 
+  
 
 def get_incident(
     incident_id: UUID,

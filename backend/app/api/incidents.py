@@ -32,10 +32,17 @@ def create_new_incident(
     data: IncidentCreate,
     current_user: User = Depends(get_current_user),
 ):
-    return create_incident(
-        data=data,
-        user_id=UUID(current_user.user_id),
-    )
+    
+    try:
+        return create_incident(
+            data=data,
+            user_id=UUID(current_user.user_id),
+        )
+    except PermissionError:
+        raise HTTPException(
+            status_code=404,
+            detail="Active device not found for this user.",
+        )
 
 
 @router.get(
