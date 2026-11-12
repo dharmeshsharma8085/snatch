@@ -1,7 +1,7 @@
 
 from datetime import datetime
 from typing import Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -26,9 +26,8 @@ class EmergencyApprovalRequest(BaseModel):
 
 
 class EmergencyResponse(BaseModel):
-    emergency_id: UUID = Field(
-        default_factory=uuid4
-    )
+    emergency_id: UUID 
+    
 
     incident_id: UUID
     device_id: UUID
@@ -53,9 +52,9 @@ class EmergencyResponse(BaseModel):
         "queued",
         "sent",
         "partially_failed",
-        "failed"
+        "failed",
+        "delivery_unknown",
     ]
-
     recipient_count: int
     attempt_count: int
 

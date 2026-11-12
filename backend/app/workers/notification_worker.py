@@ -192,7 +192,10 @@ def process_notification_queue():
                     "ready",
                 )
             ):
-                notification.status = "queued"
+                notification.status = "failed"
+                notification.last_error = (
+                    "Emergency is missing, unapproved, or not eligible for delivery."
+                )
                 notification.claimed_by = None
                 notification.claimed_at = None
                 notification.claim_expires_at = None

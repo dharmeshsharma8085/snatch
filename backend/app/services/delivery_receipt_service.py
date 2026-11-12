@@ -38,7 +38,11 @@ def process_delivery_receipt(message_id: str, status: str):
             }
 
         # Ignore duplicate or late receipts after a terminal state.
-        if notification.status in ("sent", "failed"):
+        if notification.status in (
+            "sent",
+            "failed",
+            "delivery_unknown",
+        ):
             return {
                 "updated": False,
                 "message": "Notification already has a final status.",
@@ -68,6 +72,11 @@ def process_delivery_receipt(message_id: str, status: str):
                     == notification.emergency_id
                 )
             ).all()
+            terminal_statuses = {
+                "sent",
+                "failed",
+                "delivery_unknown",
+            }
 
             if deliveries and all(
                 item.status == "sent" for item in deliveries
@@ -79,17 +88,23 @@ def process_delivery_receipt(message_id: str, status: str):
             ):
                 emergency.delivery_status = "failed"
 
-            elif (
-                any(item.status == "sent" for item in deliveries)
-                or any(item.status == "failed" for item in deliveries)
-            ) and all(
-                item.status in ("sent", "failed")
+            elif deliveries and all(
+                item.status in terminal_statuses
                 for item in deliveries
             ):
-                emergency.delivery_status = "partially_failed"
+                if any(
+                    item.status == "delivery_unknown"
+                    for item in deliveries
+                ):
+                    emergency.delivery_status = "delivery_unknown"
+                else:
+                    emergency.delivery_status = "partially_failed"
 
             else:
                 emergency.delivery_status = "queued"
+                        
+
+            
 
         db.commit()
 
