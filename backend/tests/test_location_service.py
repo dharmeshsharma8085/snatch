@@ -77,21 +77,20 @@ def location_db(monkeypatch):
 
     engine.dispose()
 
-
 def create_location(
     device_id=None,
     consent=True,
     captured_at=None,
+    latitude=28.6139,
 ):
     return LocationUpdate(
         device_id=device_id or uuid4(),
-        latitude=28.6139,
+        latitude=latitude,
         longitude=77.2090,
         accuracy_m=10,
         captured_at=captured_at or datetime.now(timezone.utc),
         consent_granted=consent,
     )
-
 
 # -------------------------------
 # Validation tests
@@ -213,17 +212,17 @@ def test_user_cannot_get_another_users_location(location_db):
 
 def test_last_known_location_returns_latest_record(location_db):
     user_id, device_id, _ = location_db
-
     older_location = create_location(
         device_id=device_id,
         captured_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+        latitude=28.5,
     )
 
     newer_location = create_location(
         device_id=device_id,
         captured_at=datetime.now(timezone.utc),
+        latitude=28.7,
     )
-
     location_service.save_location_update(
         older_location,
         user_id,
@@ -238,6 +237,31 @@ def test_last_known_location_returns_latest_record(location_db):
         device_id,
         user_id,
     )
+    
+    
 
     assert result is not None
     assert result.latitude == newer_location.latitude
+
+
+def test_inactive_device_cannot_get_last_known_location(location_db):
+    user_id, device_id, TestSessionLocal = location_db
+
+    location = create_location(device_id=device_id)
+
+    location_service.save_location_update(
+        location,
+        user_id,
+    )
+
+    with TestSessionLocal() as db:
+        device = db.get(Device, str(device_id))
+        device.is_active = False
+        db.commit()
+
+    result = location_service.get_last_known_location(
+        device_id,
+        user_id,
+    )
+
+    assert result is None

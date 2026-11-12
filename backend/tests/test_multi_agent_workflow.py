@@ -2,7 +2,7 @@
 import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
-
+from app.services import evidence_service
 from app.graph.workflow import snatch_graph
 from app.models.user import User
 from app.models.device import Device
@@ -74,6 +74,11 @@ def test_all_specialists_workflow(test_db, monkeypatch):
 
     monkeypatch.setattr(
         emergency_service,
+        "SessionLocal",
+        test_db
+    )
+    monkeypatch.setattr(
+        evidence_service,
         "SessionLocal",
         test_db
     )

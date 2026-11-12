@@ -119,12 +119,28 @@ def evidence_manager_node(state: SnatchState) -> dict:
 
     try:
         evidence = EvidenceCreate.model_validate(evidence_data)
-        result = create_evidence(evidence)
+
+        # Use authenticated identity from the workflow event.
+        event = state.get("event") or {}
+        raw_user_id = event.get("user_id")
+
+        user_id = (
+            UUID(str(raw_user_id))
+            if raw_user_id
+            else None
+        )
+
+        result = create_evidence(
+            evidence,
+            user_id=user_id,
+        )
 
         trace.append("Evidence Manager Agent")
 
         return {
-            "evidence_records": [result.model_dump(mode="json")],
+            "evidence_records": [
+                result.model_dump(mode="json")
+            ],
             "agent_trace": trace
         }
 

@@ -1,6 +1,6 @@
 from datetime import datetime
 from uuid import UUID
-
+from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -51,6 +51,6 @@ class LocationResponse(BaseModel):
 
     captured_at: datetime
 
-    status: str
+    status: Literal["fresh", "stale"]
 
     message: str

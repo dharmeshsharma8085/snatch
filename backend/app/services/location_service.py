@@ -116,6 +116,7 @@ def get_last_known_location(
             .where(
                 DeviceLocation.device_id == str(device_id),
                 Device.user_id == str(user_id),
+                Device.is_active.is_(True),
             )
             .order_by(
                 DeviceLocation.captured_at.desc(),
