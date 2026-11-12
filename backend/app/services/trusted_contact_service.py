@@ -16,11 +16,13 @@ def create_trusted_contact(
     user_id: UUID,
 ):
     with SessionLocal() as db:
+
         contact = TrustedContact(
             user_id=str(user_id),
             name=data.name,
             phone_number=data.phone_number,
             email=str(data.email) if data.email else None,
+            is_active=True,
         )
 
         db.add(contact)

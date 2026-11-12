@@ -15,7 +15,6 @@ class TrustedContactUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=100)
     phone_number: str | None = Field(default=None, min_length=7, max_length=20)
     email: EmailStr | None = None
-    is_active: bool | None = None
 
 
 class TrustedContactResponse(BaseModel):
