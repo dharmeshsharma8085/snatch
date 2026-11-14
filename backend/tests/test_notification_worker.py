@@ -206,7 +206,8 @@ def test_worker_does_not_send_without_owner_approval(
 
     with test_db() as db:
         saved = db.get(NotificationDelivery, delivery_id)
-        assert saved.status == "queued"
+        assert saved.status == "failed"
+        assert saved.last_error is not None
         assert saved.attempt_count == 0
 
 
