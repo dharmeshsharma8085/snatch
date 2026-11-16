@@ -29,6 +29,7 @@ from app.graph.workflow import snatch_graph
 from app.workers.device_monitor import device_monitor_loop
 from app.api.trusted_contacts import router as trusted_contacts_router
 from app.api.notifications import router as notifications_router
+from app.api.vonage_webhook import router as vonage_webhook_router
 from app.workers.notification_runner import notification_worker_loop
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -99,7 +100,7 @@ app.include_router(location_router)
 app.include_router(trusted_contacts_router)
 app.include_router(notifications_router)
 
-
+app.include_router(vonage_webhook_router)
 
 @app.get("/")
 async def root():

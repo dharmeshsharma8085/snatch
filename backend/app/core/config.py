@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str | None = None
     vonage_signature_secret: str = ""
+    vonage_signature_method: str = ""
     api_version: str = "v1"
 
     model_config = SettingsConfigDict(
