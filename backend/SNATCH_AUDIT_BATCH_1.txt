@@ -1,0 +1,1676 @@
+
+
+========== app\core\config.py ==========
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    app_name: str = "SNATCH"
+    app_env: str = "development"
+    debug: bool = True
+    vonage_api_key: str = ""
+    vonage_api_secret: str = ""
+    vonage_sender_id: str = "SNATCH"
+    sms_live_enabled: bool = False
+    openai_api_key: str | None = None
+    openai_model: str | None = None
+    vonage_signature_secret: str = ""
+    vonage_signature_method: str = ""
+    api_version: str = "v1"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
+
+
+settings = Settings()
+
+
+========== app\core\security.py ==========
+
+import os
+
+import jwt
+from dotenv import load_dotenv
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import select
+
+from app.database.database import SessionLocal
+from app.models.user import User
+
+load_dotenv()
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+
+bearer_scheme = HTTPBearer()
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    unauthorized = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired authentication token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+        )
+
+        user_id = payload.get("sub")
+
+        if not user_id:
+            raise unauthorized
+
+    except jwt.InvalidTokenError:
+        raise unauthorized
+
+    with SessionLocal() as db:
+        user = db.scalar(
+            select(User).where(User.user_id == user_id)
+        )
+
+        if user is None or not user.is_active:
+            raise unauthorized
+
+        return user
+
+
+========== app\api\auth.py ==========
+from fastapi import APIRouter, HTTPException, status
+
+from app.schemas.auth import (
+    UserRegister,
+    UserLogin,
+    UserResponse,
+    TokenResponse,
+)
+from app.services.auth_service import register_user, login_user
+
+router = APIRouter(
+    prefix="/api/v1/auth",
+    tags=["Authentication"],
+)
+
+
+@router.post(
+    "/register",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def register(data: UserRegister):
+    try:
+        return register_user(data)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        )
+
+
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+)
+def login(data: UserLogin):
+    try:
+        return login_user(data)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(error),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+========== app\api\emergency.py ==========
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from app.core.security import get_current_user
+from app.schemas.emergency import (
+    EmergencyRequest,
+    EmergencyApprovalRequest,
+    EmergencyResponse,
+)
+from app.services.emergency_service import (
+    process_emergency,
+    approve_emergency,
+)
+
+router = APIRouter(
+    prefix="/api/v1/emergency",
+    tags=["Emergency Response"],
+)
+
+
+@router.post(
+    "/",
+    response_model=EmergencyResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_emergency(
+    request: EmergencyRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return process_emergency(
+            request,
+            UUID(str(current_user.user_id)),
+        )
+
+    except PermissionError:
+        raise HTTPException(
+            status_code=404,
+            detail="Incident, device, or trusted contact not found.",
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        )
+
+
+@router.post(
+    "/{emergency_id}/approve",
+    response_model=EmergencyResponse,
+)
+def approve_emergency_request(
+    emergency_id: UUID,
+    request: EmergencyApprovalRequest,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return approve_emergency(
+            emergency_id=emergency_id,
+            user_id=UUID(str(current_user.user_id)),
+            owner_confirmed=request.owner_confirmed,
+        )
+
+    except PermissionError:
+        raise HTTPException(
+            status_code=404,
+            detail="Emergency record not found.",
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        )
+
+
+========== app\api\notifications.py ==========
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.core.security import get_current_user
+from app.services.notification_service import queue_emergency_notifications
+from app.schemas.notification import NotificationQueueResponse
+router = APIRouter(
+    prefix="/api/v1/notifications",
+    tags=["Notification Delivery"],
+)
+from app.schemas.notification import EmergencyNotificationStatusResponse
+from app.services.notification_status_service import (
+    get_emergency_notification_status,
+)
+@router.post(
+    "/emergencies/{emergency_id}/queue",
+    response_model=NotificationQueueResponse,
+)
+def queue_notifications(
+    emergency_id: UUID,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return queue_emergency_notifications(
+            emergency_id=emergency_id,
+            user_id=UUID(str(current_user.user_id)),
+        )
+
+    except PermissionError:
+        raise HTTPException(
+            status_code=404,
+            detail="Emergency record not found.",
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        )
+        
+        
+@router.get(
+    "/emergencies/{emergency_id}/status",
+    response_model=EmergencyNotificationStatusResponse,
+)
+def get_notification_status(
+    emergency_id: UUID,
+    current_user=Depends(get_current_user),
+):
+    try:
+        return get_emergency_notification_status(
+            emergency_id=emergency_id,
+            user_id=UUID(str(current_user.user_id)),
+        )
+
+    except PermissionError:
+        raise HTTPException(
+            status_code=404,
+            detail="Emergency record not found.",
+        )
+
+
+========== app\api\vonage_webhook.py ==========
+
+import hashlib
+import hmac
+import logging
+from urllib.parse import parse_qsl
+
+from fastapi import APIRouter, HTTPException, Request, status
+
+from app.core.config import settings
+from app.services.delivery_receipt_service import (
+    process_delivery_receipt,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/api/v1/webhooks/vonage",
+    tags=["Vonage Webhooks"],
+)
+
+
+def verify_sms_signature(
+    params: dict[str, str],
+    secret: str,
+) -> bool:
+    """
+    Verify Vonage SMS API SHA-256 HMAC signature.
+    """
+
+    received_signature = params.get("sig")
+
+    if not received_signature:
+        return False
+
+    signing_params = {
+        key: value.replace("&", "_").replace("=", "_")
+        for key, value in params.items()
+        if key != "sig"
+    }
+
+    signing_string = "".join(
+        f"&{key}={signing_params[key]}"
+        for key in sorted(signing_params)
+    )
+
+    expected_signature = hmac.new(
+        secret.encode("utf-8"),
+        signing_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(
+        expected_signature.lower(),
+        received_signature.lower(),
+    )
+
+
+@router.post("/delivery-receipt")
+async def vonage_delivery_receipt(request: Request):
+    """
+    Public Vonage SMS delivery receipt webhook.
+    """
+
+    if not settings.vonage_signature_secret:
+        logger.error("Vonage signature secret is not configured.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook verification is not configured.",
+        )
+
+    if request.query_params:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Query parameters are not supported.",
+        )
+
+    content_type = request.headers.get(
+        "content-type", ""
+    ).split(";")[0].strip().lower()
+
+    if content_type != "application/x-www-form-urlencoded":
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Unsupported webhook content type.",
+        )
+
+    body = await request.body()
+
+    try:
+        pairs = parse_qsl(
+            body.decode("utf-8"),
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+    except (UnicodeDecodeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid webhook payload.",
+        )
+
+    params = dict(pairs)
+
+    # Reject duplicate parameters to avoid ambiguous signatures.
+    if len(params) != len(pairs):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Duplicate webhook parameters.",
+        )
+
+    if not params.get("timestamp") or not params.get("nonce"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing timestamp or nonce.",
+        )
+
+    if not verify_sms_signature(
+        params,
+        settings.vonage_signature_secret,
+    ):
+        logger.warning("Invalid Vonage SMS webhook signature.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid webhook signature.",
+        )
+
+    from app.services.webhook_replay_service import (
+        register_webhook_nonce,
+    )
+
+    if not register_webhook_nonce(
+        timestamp=params["timestamp"],
+        nonce=params["nonce"],
+    ):
+        logger.warning("Rejected expired or replayed Vonage webhook.")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Expired or previously used webhook nonce.",
+        )
+    message_id = params.get("messageId")
+    provider_status = params.get("status")
+
+    if not message_id or not provider_status:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing delivery receipt fields.",
+        )
+
+    try:
+        result = process_delivery_receipt(
+            message_id=message_id,
+            status=provider_status,
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported delivery receipt status.",
+        )
+
+    return {
+        "received": True,
+        "updated": result["updated"],
+    }
+
+
+========== app\services\emergency_service.py ==========
+
+from uuid import UUID
+
+from sqlalchemy import select
+
+from app.database.database import SessionLocal
+from app.models.emergency import Emergency
+from app.models.incident import Incident
+from app.models.device import Device
+from app.models.trusted_contact import TrustedContact
+
+from app.schemas.emergency import EmergencyResponse
+
+
+def _to_response(record: Emergency) -> EmergencyResponse:
+    if record.status == "pending_owner_approval":
+        message = "Emergency prepared. Waiting for owner approval."
+    elif record.status == "approved_pending_delivery":
+        message = "Emergency approved. Ready for notification delivery."
+    else:
+        message = "Emergency request cancelled by owner."
+
+    return EmergencyResponse(
+        emergency_id=record.emergency_id,
+        incident_id=record.incident_id,
+        device_id=record.device_id,
+        trigger_reason=record.trigger_reason,
+        trusted_contact_ids=record.trusted_contact_ids,
+        status=record.status,
+        owner_approved=record.owner_approved,
+        delivery_status=record.delivery_status,
+        recipient_count=record.recipient_count,
+        attempt_count=record.attempt_count,
+        message=message,
+        created_at=record.created_at,
+    )
+
+
+def process_emergency(
+    request,
+    user_id: UUID,
+) -> EmergencyResponse:
+
+    with SessionLocal() as db:
+
+        user_id_str = str(user_id)
+        incident_id = str(request.incident_id)
+        device_id = str(request.device_id)
+
+        # 1. Verify incident ownership
+        incident = db.scalar(
+            select(Incident).where(
+                Incident.incident_id == incident_id,
+                Incident.user_id == user_id_str,
+            )
+        )
+
+        if incident is None:
+            raise PermissionError("Incident not found.")
+
+        if incident.status in ("cancelled", "closed"):
+            raise ValueError("This incident cannot start an emergency.")
+
+        # 2. Verify incident-device relationship
+        if incident.device_id != device_id:
+            raise ValueError("Device does not match the incident.")
+
+        # 3. Verify active device ownership
+        device = db.scalar(
+            select(Device).where(
+                Device.device_id == device_id,
+                Device.user_id == user_id_str,
+                Device.is_active.is_(True),
+            )
+        )
+
+        if device is None:
+            raise PermissionError("Active device not found.")
+
+        # 4. Validate trusted contacts
+        contact_ids = [str(item) for item in request.trusted_contact_ids]
+
+        if len(contact_ids) != len(set(contact_ids)):
+            raise ValueError("Duplicate trusted contact IDs are not allowed.")
+
+        if contact_ids:
+            contacts = db.scalars(
+                select(TrustedContact).where(
+                    TrustedContact.contact_id.in_(contact_ids),
+                    TrustedContact.user_id == user_id_str,
+                    TrustedContact.is_active.is_(True),
+                )
+            ).all()
+
+            if len(contacts) != len(contact_ids):
+                raise PermissionError(
+                    "One or more trusted contacts are unavailable."
+                )
+                        # 5. Prevent duplicate active emergencies for the same incident
+        existing_emergency = db.scalar(
+            select(Emergency).where(
+                Emergency.incident_id == incident_id,
+                Emergency.user_id == user_id_str,
+                Emergency.status.in_([
+                    "pending_owner_approval",
+                    "approved_pending_delivery",
+                ]),
+            )
+        )
+
+        if existing_emergency is not None:
+            raise ValueError(
+                "An active emergency already exists for this incident."
+            )
+
+        # 5. Create emergency pending owner approval
+        emergency = Emergency(
+            user_id=user_id_str,
+            incident_id=incident_id,
+            device_id=device_id,
+            trigger_reason=request.trigger_reason,
+            trusted_contact_ids=contact_ids,
+            owner_approved=False,
+            status="pending_owner_approval",
+            delivery_status="not_started",
+            recipient_count=len(contact_ids),
+            attempt_count=0,
+        )
+
+        db.add(emergency)
+        db.commit()
+        db.refresh(emergency)
+
+        return _to_response(emergency)
+
+
+def approve_emergency(
+    emergency_id: UUID,
+    user_id: UUID,
+    owner_confirmed: bool,
+) -> EmergencyResponse:
+
+    with SessionLocal() as db:
+
+        emergency = db.scalar(
+            select(Emergency).where(
+                Emergency.emergency_id == str(emergency_id),
+                Emergency.user_id == str(user_id),
+            )
+        )
+
+        if emergency is None:
+            raise PermissionError("Emergency not found.")
+
+        if emergency.status != "pending_owner_approval":
+            raise ValueError(
+                "Emergency is not waiting for owner approval."
+            )
+
+        if owner_confirmed:
+            if not emergency.trusted_contact_ids:
+                raise ValueError(
+                    "Add at least one active trusted contact before approval."
+                )
+
+            emergency.owner_approved = True
+            emergency.status = "approved_pending_delivery"
+            emergency.delivery_status = "ready"
+
+        else:
+            emergency.owner_approved = False
+            emergency.status = "cancelled"
+            emergency.delivery_status = "not_started"
+
+        db.commit()
+        db.refresh(emergency)
+
+        return _to_response(emergency)
+
+
+========== app\services\notification_service.py ==========
+from uuid import UUID
+
+from sqlalchemy import select
+
+from app.database.database import SessionLocal
+from app.models.emergency import Emergency
+from app.models.trusted_contact import TrustedContact
+from app.models.notification import NotificationDelivery
+
+
+def queue_emergency_notifications(
+    emergency_id: UUID,
+    user_id: UUID,
+):
+    with SessionLocal() as db:
+
+        emergency = db.scalar(
+            select(Emergency).where(
+                Emergency.emergency_id == str(emergency_id),
+                Emergency.user_id == str(user_id),
+            )
+        )
+
+        if emergency is None:
+            raise PermissionError("Emergency record not found.")
+
+        if (
+            emergency.status != "approved_pending_delivery"
+            or not emergency.owner_approved
+        ):
+            raise ValueError(
+                "Emergency must be approved before queueing notifications."
+            )
+
+        contact_ids = emergency.trusted_contact_ids or []
+
+        if not contact_ids:
+            raise ValueError("No trusted contacts selected.")
+
+        contacts = db.scalars(
+            select(TrustedContact).where(
+                TrustedContact.contact_id.in_(contact_ids),
+                TrustedContact.user_id == str(user_id),
+                TrustedContact.is_active.is_(True),
+            )
+        ).all()
+
+        if len(contacts) != len(set(contact_ids)):
+            raise ValueError(
+                "One or more trusted contacts are no longer active."
+            )
+
+        created_count = 0
+
+        for contact in contacts:
+
+            existing = db.scalar(
+                select(NotificationDelivery).where(
+                    NotificationDelivery.emergency_id
+                    == emergency.emergency_id,
+                    NotificationDelivery.contact_id
+                    == contact.contact_id,
+                    NotificationDelivery.channel == "sms",
+                )
+            )
+
+            if existing is not None:
+                continue
+
+            delivery = NotificationDelivery(
+                emergency_id=emergency.emergency_id,
+                contact_id=contact.contact_id,
+                channel="sms",
+                status="queued",
+                attempt_count=0,
+            )
+
+            db.add(delivery)
+            created_count += 1
+
+        emergency.delivery_status = "queued"
+        db.commit()
+
+        return {
+            "emergency_id": emergency.emergency_id,
+            "delivery_status": emergency.delivery_status,
+            "recipient_count": len(contacts),
+            "queued_count": created_count,
+            "message": "Notification records queued successfully.",
+        }
+
+
+========== app\services\delivery_receipt_service.py ==========
+
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+
+from app.database.database import SessionLocal
+from app.models.notification import NotificationDelivery
+from app.models.emergency import Emergency
+
+
+def process_delivery_receipt(message_id: str, status: str):
+    normalized_status = status.strip().lower()
+
+    allowed_statuses = {
+        "delivered",
+        "failed",
+        "rejected",
+        "expired",
+        "accepted",
+    }
+
+    if normalized_status not in allowed_statuses:
+        raise ValueError("Unsupported delivery receipt status.")
+
+    with SessionLocal() as db:
+        notification = db.scalar(
+            select(NotificationDelivery)
+            .where(
+                NotificationDelivery.provider_message_id == message_id
+            )
+            .with_for_update()
+        )
+
+        if notification is None:
+            return {
+                "updated": False,
+                "message": "Notification not found.",
+            }
+
+        # Ignore duplicate or late receipts after a terminal state.
+        if notification.status in (
+            "sent",
+            "failed",
+            "delivery_unknown",
+        ):
+            return {
+                "updated": False,
+                "message": "Notification already has a final status.",
+            }
+
+        notification.provider_status = normalized_status
+
+        if normalized_status == "delivered":
+            notification.status = "sent"
+            notification.delivered_at = datetime.now(timezone.utc)
+            notification.last_error = None
+
+        elif normalized_status in ("failed", "rejected", "expired"):
+            notification.status = "failed"
+            notification.last_error = (
+                f"Vonage delivery status: {normalized_status}"
+            )
+
+        db.flush()
+
+        emergency = db.get(Emergency, notification.emergency_id)
+
+        if emergency is not None:
+            deliveries = db.scalars(
+                select(NotificationDelivery).where(
+                    NotificationDelivery.emergency_id
+                    == notification.emergency_id
+                )
+            ).all()
+            terminal_statuses = {
+                "sent",
+                "failed",
+                "delivery_unknown",
+            }
+
+            if deliveries and all(
+                item.status == "sent" for item in deliveries
+            ):
+                emergency.delivery_status = "sent"
+
+            elif deliveries and all(
+                item.status == "failed" for item in deliveries
+            ):
+                emergency.delivery_status = "failed"
+
+            elif deliveries and all(
+                item.status in terminal_statuses
+                for item in deliveries
+            ):
+                if any(
+                    item.status == "delivery_unknown"
+                    for item in deliveries
+                ):
+                    emergency.delivery_status = "delivery_unknown"
+                else:
+                    emergency.delivery_status = "partially_failed"
+
+            else:
+                emergency.delivery_status = "queued"
+                        
+
+            
+
+        db.commit()
+
+        return {
+            "updated": True,
+            "delivery_status": notification.status,
+            "provider_status": notification.provider_status,
+            "message": "Delivery receipt processed.",
+        }
+
+
+========== app\services\webhook_replay_service.py ==========
+
+import time
+from datetime import datetime, timezone, timedelta
+
+from sqlalchemy import delete
+from sqlalchemy.exc import IntegrityError
+
+from app.database.database import SessionLocal
+from app.models.webhook_nonce import WebhookNonce
+
+
+MAX_TIMESTAMP_AGE_SECONDS = 300
+
+
+def register_webhook_nonce(
+    timestamp: str,
+    nonce: str,
+) -> bool:
+    """
+    Validate callback timestamp and atomically register its nonce.
+    Returns False for stale timestamps or previously used nonces.
+    """
+
+    if not timestamp or not nonce:
+        return False
+
+    if len(nonce) > 255:
+        return False
+
+    try:
+        callback_timestamp = int(timestamp)
+    except (ValueError, TypeError):
+        return False
+
+    now_epoch = int(time.time())
+
+    if abs(now_epoch - callback_timestamp) > MAX_TIMESTAMP_AGE_SECONDS:
+        return False
+
+    now = datetime.now(timezone.utc)
+
+    with SessionLocal() as db:
+        try:
+            # Remove expired nonce records.
+            db.execute(
+                delete(WebhookNonce).where(
+                    WebhookNonce.expires_at < now
+                )
+            )
+
+            db.add(
+                WebhookNonce(
+                    nonce=nonce,
+                    created_at=now,
+                    expires_at=now + timedelta(
+                        seconds=MAX_TIMESTAMP_AGE_SECONDS
+                    ),
+                )
+            )
+
+            db.commit()
+            return True
+
+        except IntegrityError:
+            db.rollback()
+            return False
+
+        except Exception:
+            db.rollback()
+            raise
+
+
+========== app\models\emergency.py ==========
+
+from datetime import datetime, timezone
+from uuid import uuid4
+from sqlalchemy import (
+    String,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Text,
+    Index,
+    JSON,
+    Boolean,
+    text,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database.database import Base
+
+
+class Emergency(Base):
+    __tablename__ = "emergency_records"
+
+    emergency_id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid4()),
+    )
+
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    incident_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("incidents.incident_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    device_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("devices.device_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    trigger_reason: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    trusted_contact_ids: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+
+    owner_approved: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+        default="pending_owner_approval",
+    )
+
+    delivery_status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="not_started",
+    )
+
+    recipient_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_emergency_user_created",
+            "user_id",
+            "created_at",
+        ),
+        Index(
+            "uq_active_emergency_per_incident",
+            "incident_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending_owner_approval', "
+                "'approved_pending_delivery')"
+            ),
+            sqlite_where=text(
+                "status IN ('pending_owner_approval', "
+                "'approved_pending_delivery')"
+            ),
+        ),
+    )   
+
+
+========== app\models\notification.py ==========
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from sqlalchemy import (
+    String,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Text,
+    Index,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database.database import Base
+
+
+class NotificationDelivery(Base):
+    __tablename__ = "notification_deliveries"
+
+    delivery_id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid4()),
+    )
+
+    emergency_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("emergency_records.emergency_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    contact_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("trusted_contacts.contact_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    channel: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="sms",
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="queued",
+    )
+
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    last_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    
+    claimed_by: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    provider_message_id: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        unique=True,
+    )
+
+    provider_status: Mapped[str | None] = mapped_column(
+        String(30),
+        nullable=True,
+    )
+
+    delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    
+    
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "emergency_id",
+            "contact_id",
+            "channel",
+            name="uq_emergency_contact_channel",
+        ),
+        Index(
+            "ix_notification_status_next_attempt",
+            "status",
+            "next_attempt_at",
+        ),
+        Index(
+            "ix_notification_claim_expiry",
+            "status",
+            "claim_expires_at",
+        ),
+    )
+
+
+========== app\models\webhook_nonce.py ==========
+
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from sqlalchemy import String, DateTime, Index
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database.database import Base
+
+
+class WebhookNonce(Base):
+    __tablename__ = "webhook_nonces"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid4()),
+    )
+
+    nonce: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+
+    __table_args__ = (
+        Index("ix_webhook_nonce_expiry", "expires_at"),
+    )
+
+
+========== app\workers\notification_worker.py ==========
+
+from datetime import datetime, timezone, timedelta
+from uuid import uuid4
+
+from sqlalchemy import select, update, or_
+
+from app.database.database import SessionLocal
+from app.models.emergency import Emergency
+from app.models.trusted_contact import TrustedContact
+from app.models.notification import NotificationDelivery
+from app.services.sms_provider import get_sms_provider
+from app.core.config import settings
+
+
+MAX_ATTEMPTS = 3
+BATCH_SIZE = 20
+CLAIM_LEASE_SECONDS = 300
+
+RETRY_DELAYS = {
+    1: 30,
+    2: 60,
+    3: 120,
+}
+
+
+def update_emergency_delivery_status(db, emergency_id):
+    emergency = db.get(Emergency, emergency_id)
+
+    if emergency is None:
+        return
+
+    deliveries = db.scalars(
+        select(NotificationDelivery).where(
+            NotificationDelivery.emergency_id == emergency_id
+        )
+    ).all()
+
+    if not deliveries:
+        return
+
+    statuses = [item.status for item in deliveries]
+
+    terminal = {"sent", "failed", "delivery_unknown"}
+
+    if all(status == "sent" for status in statuses):
+        emergency.delivery_status = "sent"
+
+    elif all(status == "failed" for status in statuses):
+        emergency.delivery_status = "failed"
+
+    elif all(status in terminal for status in statuses):
+        if "delivery_unknown" in statuses:
+            emergency.delivery_status = "delivery_unknown"
+        else:
+            emergency.delivery_status = "partially_failed"
+
+    else:
+        emergency.delivery_status = "queued"
+
+
+def recover_expired_claims():
+    now = datetime.now(timezone.utc)
+
+    with SessionLocal() as db:
+        expired = db.scalars(
+            select(NotificationDelivery).where(
+                NotificationDelivery.status == "processing",
+                NotificationDelivery.claim_expires_at <= now,
+            )
+        ).all()
+
+        emergency_ids = set()
+
+        for item in expired:
+            item.status = "delivery_unknown"
+            item.last_error = (
+                "Worker lease expired. Provider acceptance "
+                "could not be confirmed. Manual reconciliation required."
+            )
+            item.claimed_by = None
+            item.claimed_at = None
+            item.claim_expires_at = None
+            item.next_attempt_at = None
+
+            emergency_ids.add(item.emergency_id)
+
+        for emergency_id in emergency_ids:
+            update_emergency_delivery_status(db, emergency_id)
+
+        db.commit()
+
+        return len(expired)
+
+
+def claim_notifications():
+    worker_id = f"notification-worker-{uuid4()}"
+    now = datetime.now(timezone.utc)
+    lease_expiry = now + timedelta(
+        seconds=CLAIM_LEASE_SECONDS
+    )
+
+    with SessionLocal() as db:
+        claimable_ids = (
+            select(NotificationDelivery.delivery_id)
+            .where(
+                NotificationDelivery.status == "queued",
+                or_(
+                    NotificationDelivery.next_attempt_at.is_(None),
+                    NotificationDelivery.next_attempt_at <= now,
+                ),
+            )
+            .order_by(
+                NotificationDelivery.created_at,
+                NotificationDelivery.delivery_id,
+            )
+            .limit(BATCH_SIZE)
+            .with_for_update(skip_locked=True)
+        )
+
+        statement = (
+            update(NotificationDelivery)
+            .where(
+                NotificationDelivery.delivery_id.in_(claimable_ids)
+            )
+            .values(
+                status="processing",
+                claimed_by=worker_id,
+                claimed_at=now,
+                claim_expires_at=lease_expiry,
+            )
+            .returning(NotificationDelivery.delivery_id)
+        )
+
+        claimed_ids = list(db.scalars(statement).all())
+
+        db.commit()
+
+        return claimed_ids
+
+
+def process_notification_queue():
+
+    if not settings.sms_live_enabled:
+        return {
+            "processed_count": 0,
+            "sent_count": 0,
+            "failed_count": 0,
+            "unknown_count": 0,
+            "recovered_count": 0,
+            "max_attempts": MAX_ATTEMPTS,
+            "skipped": True,
+            "message": "SMS is disabled. Notification queue remains untouched.",
+        }
+
+    recovered_count = recover_expired_claims()
+    claimed_ids = claim_notifications()
+
+    processed_count = 0
+    sent_count = 0
+    failed_count = 0
+    unknown_count = 0
+
+    provider = get_sms_provider()
+
+    for delivery_id in claimed_ids:
+
+        # Read and validate before contacting the provider.
+        with SessionLocal() as db:
+            notification = db.get(
+                NotificationDelivery,
+                delivery_id,
+            )
+
+            if notification is None:
+                continue
+
+            if notification.status != "processing":
+                continue
+
+            worker_id = notification.claimed_by
+            emergency = db.get(
+                Emergency,
+                notification.emergency_id,
+            )
+
+            if (
+                emergency is None
+                or not emergency.owner_approved
+                or emergency.status != "approved_pending_delivery"
+                or emergency.delivery_status not in (
+                    "queued",
+                    "ready",
+                )
+            ):
+                notification.status = "failed"
+                notification.last_error = (
+                    "Emergency is missing, unapproved, or not eligible for delivery."
+                )
+                notification.claimed_by = None
+                notification.claimed_at = None
+                notification.claim_expires_at = None
+                db.commit()
+                continue
+
+            contact = db.get(
+                TrustedContact,
+                notification.contact_id,
+            )
+
+            if (
+                contact is None
+                or not contact.is_active
+                or contact.user_id != emergency.user_id
+                or contact.contact_id not in (
+                    emergency.trusted_contact_ids or []
+                )
+            ):
+                notification.status = "failed"
+                notification.last_error = (
+                    "Recipient validation failed. SMS not sent."
+                )
+                notification.next_attempt_at = None
+                notification.claimed_by = None
+                notification.claimed_at = None
+                notification.claim_expires_at = None
+
+                update_emergency_delivery_status(
+                    db,
+                    notification.emergency_id,
+                )
+
+                db.commit()
+
+                processed_count += 1
+                failed_count += 1
+                continue
+
+            phone_number = contact.phone_number
+            emergency_id = notification.emergency_id
+
+        # No database transaction or row lock is held
+        # while making the external provider request.
+        message = (
+            "SNATCH emergency alert: The device owner has "
+            "approved this notification. Please contact the "
+            "owner directly. This alert does not confirm theft."
+        )
+
+        try:
+            result = provider.send_sms(
+                phone_number=phone_number,
+                message=message,
+            )
+        except Exception:
+            # A crash or unexpected provider exception can leave
+            # the notification processing. Lease recovery will
+            # conservatively classify it as delivery_unknown.
+            continue
+
+        now = datetime.now(timezone.utc)
+
+        with SessionLocal() as db:
+            notification = db.scalar(
+                select(NotificationDelivery).where(
+                    NotificationDelivery.delivery_id == delivery_id,
+                    NotificationDelivery.status == "processing",
+                    NotificationDelivery.claimed_by == worker_id,
+                )
+            )
+
+            # Another recovery process may already have handled it.
+            if notification is None:
+                continue
+
+            notification.attempt_count += 1
+            processed_count += 1
+
+            notification.claimed_by = None
+            notification.claimed_at = None
+            notification.claim_expires_at = None
+
+            if result.outcome_unknown:
+                notification.status = "delivery_unknown"
+                notification.provider_status = "unknown"
+                notification.last_error = (
+                    result.error
+                    or "Provider acceptance could not be confirmed."
+                )
+                notification.next_attempt_at = None
+                unknown_count += 1
+
+            elif result.success and result.provider_message_id:
+                notification.status = "submitted"
+                notification.provider_message_id = (
+                    result.provider_message_id
+                )
+                notification.provider_status = "accepted"
+                notification.last_error = None
+                notification.next_attempt_at = None
+                sent_count += 1
+
+            elif result.success:
+                notification.status = "delivery_unknown"
+                notification.provider_status = "unknown"
+                notification.last_error = (
+                    "Provider accepted request without a message ID. "
+                    "Manual reconciliation required."
+                )
+                notification.next_attempt_at = None
+                unknown_count += 1
+
+            else:
+                notification.last_error = (
+                    result.error or "SMS provider request failed."
+                )
+
+                if notification.attempt_count >= MAX_ATTEMPTS:
+                    notification.status = "failed"
+                    notification.next_attempt_at = None
+                    failed_count += 1
+                else:
+                    delay = RETRY_DELAYS[
+                        notification.attempt_count
+                    ]
+                    notification.status = "queued"
+                    notification.next_attempt_at = (
+                        now + timedelta(seconds=delay)
+                    )
+
+            update_emergency_delivery_status(
+                db,
+                emergency_id,
+            )
+
+            db.commit()
+
+    return {
+        "processed_count": processed_count,
+        "sent_count": sent_count,
+        "failed_count": failed_count,
+        "unknown_count": unknown_count,
+        "recovered_count": recovered_count,
+        "max_attempts": MAX_ATTEMPTS,
+        "message": "Notification queue processing completed.",
+    }
+
+
+========== app\workers\notification_runner.py ==========
+import asyncio
+import logging
+
+from app.workers.notification_worker import (
+    process_notification_queue,
+)
+
+logger = logging.getLogger(__name__)
+
+
+async def notification_worker_loop(
+    stop_event: asyncio.Event,
+    poll_interval_seconds: int = 15,
+):
+    logger.info("SNATCH Notification Worker started.")
+
+    while not stop_event.is_set():
+
+        try:
+            result = await asyncio.to_thread(
+                process_notification_queue
+            )
+
+            if result["processed_count"] > 0:
+                logger.info(
+                    "Notification worker processed %s records.",
+                    result["processed_count"],
+                )
+
+        except Exception:
+            logger.exception(
+                "Notification worker encountered an error."
+            )
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=poll_interval_seconds,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("SNATCH Notification Worker stopped.")
+
+
+========== app\database\database.py ==========
+import os
+
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing from .env")
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def check_database_connection() -> bool:
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+        return True
+
+    except Exception as error:
+        print(f"Database connection failed: {error}")
+        return False
+
+
+========== app\database\init_db.py ==========
+
+from app.database.database import Base, engine
+
+# Import all models
+from app.models.user import User
+from app.models.device import Device
+from app.models.incident import Incident
+from app.models.location import DeviceLocation
+from app.models.evidence import Evidence
+from app.models.emergency import Emergency
+from app.models.trusted_contact import TrustedContact
+from app.models.notification import NotificationDelivery
+from app.models.webhook_nonce import WebhookNonce
+
+
+def create_tables():
+    Base.metadata.create_all(bind=engine)
+
+    print("SNATCH database tables created successfully!")
+
+    print("Registered tables:")
+    for table in Base.metadata.sorted_tables:
+        print(f"- {table.name}")
+
+
+if __name__ == "__main__":
+    create_tables()
