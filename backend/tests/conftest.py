@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database.database import Base
-
+from app.models.webhook_nonce import WebhookNonce
 
 @pytest.fixture
 def test_db():

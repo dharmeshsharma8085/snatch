@@ -10,7 +10,7 @@ from app.models.evidence import Evidence
 from app.models.emergency import Emergency
 from app.models.trusted_contact import TrustedContact
 from app.models.notification import NotificationDelivery
-
+from app.models.webhook_nonce import WebhookNonce
 
 
 def create_tables():

@@ -1,7 +1,6 @@
 
 from datetime import datetime, timezone
 from uuid import uuid4
-
 from sqlalchemy import (
     String,
     DateTime,
@@ -11,6 +10,7 @@ from sqlalchemy import (
     Index,
     JSON,
     Boolean,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -107,4 +107,17 @@ class Emergency(Base):
             "user_id",
             "created_at",
         ),
-    )
+        Index(
+            "uq_active_emergency_per_incident",
+            "incident_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending_owner_approval', "
+                "'approved_pending_delivery')"
+            ),
+            sqlite_where=text(
+                "status IN ('pending_owner_approval', "
+                "'approved_pending_delivery')"
+            ),
+        ),
+    )   

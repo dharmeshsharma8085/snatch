@@ -107,6 +107,12 @@ async def vonage_delivery_receipt(request: Request):
             detail="Duplicate webhook parameters.",
         )
 
+    if not params.get("timestamp") or not params.get("nonce"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing timestamp or nonce.",
+        )
+
     if not verify_sms_signature(
         params,
         settings.vonage_signature_secret,
@@ -117,6 +123,19 @@ async def vonage_delivery_receipt(request: Request):
             detail="Invalid webhook signature.",
         )
 
+    from app.services.webhook_replay_service import (
+        register_webhook_nonce,
+    )
+
+    if not register_webhook_nonce(
+        timestamp=params["timestamp"],
+        nonce=params["nonce"],
+    ):
+        logger.warning("Rejected expired or replayed Vonage webhook.")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Expired or previously used webhook nonce.",
+        )
     message_id = params.get("messageId")
     provider_status = params.get("status")
 

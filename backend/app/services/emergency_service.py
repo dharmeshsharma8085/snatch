@@ -96,6 +96,22 @@ def process_emergency(
                 raise PermissionError(
                     "One or more trusted contacts are unavailable."
                 )
+                        # 5. Prevent duplicate active emergencies for the same incident
+        existing_emergency = db.scalar(
+            select(Emergency).where(
+                Emergency.incident_id == incident_id,
+                Emergency.user_id == user_id_str,
+                Emergency.status.in_([
+                    "pending_owner_approval",
+                    "approved_pending_delivery",
+                ]),
+            )
+        )
+
+        if existing_emergency is not None:
+            raise ValueError(
+                "An active emergency already exists for this incident."
+            )
 
         # 5. Create emergency pending owner approval
         emergency = Emergency(

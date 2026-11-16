@@ -1,7 +1,7 @@
 from unittest.mock import patch
 import hashlib
 import hmac
-
+import time
 from app.api.vonage_webhook import verify_sms_signature
 from fastapi.testclient import TestClient
 
@@ -36,8 +36,9 @@ def test_valid_signature():
     params = {
         "messageId": "test-message-123",
         "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "valid-test-nonce-123",
     }
-
     params["sig"] = generate_test_signature(params, secret)
 
     assert verify_sms_signature(params, secret) is True
@@ -47,9 +48,10 @@ def test_invalid_signature():
     params = {
         "messageId": "test-message-123",
         "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "invalid-test-nonce-123",
         "sig": "invalid-signature",
     }
-
     assert verify_sms_signature(params, "test-secret") is False
 
 
@@ -70,8 +72,9 @@ def test_missing_signature_rejected():
     params = {
         "messageId": "test-message-123",
         "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "missing-signature-test-nonce",
     }
-
     assert verify_sms_signature(params, "test-secret") is False
 
 
@@ -81,29 +84,29 @@ from urllib.parse import urlencode
 
 def test_webhook_accepts_valid_signature(client, monkeypatch):
     secret = "test-secret"
-    monkeypatch.setattr(
-        settings,
-        "vonage_signature_secret",
-        secret,
-    )
+    monkeypatch.setattr(settings, "vonage_signature_secret", secret)
 
     params = {
         "messageId": "test-message-123",
         "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "api-valid-test-nonce",
     }
     params["sig"] = generate_test_signature(params, secret)
 
-    with patch(
-        "app.api.vonage_webhook.process_delivery_receipt"
-    ) as mock_receipt:
+    with (
+        patch("app.api.vonage_webhook.process_delivery_receipt") as mock_receipt,
+        patch(
+            "app.services.webhook_replay_service.register_webhook_nonce",
+            return_value=True,
+        ) as mock_nonce,
+    ):
         mock_receipt.return_value = {"updated": True}
 
         response = client.post(
             "/api/v1/webhooks/vonage/delivery-receipt",
             content=urlencode(params),
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
 
     assert response.status_code == 200
@@ -112,27 +115,24 @@ def test_webhook_accepts_valid_signature(client, monkeypatch):
         message_id="test-message-123",
         status="delivered",
     )
+    mock_nonce.assert_called_once()
 
 
 def test_webhook_rejects_invalid_signature(client, monkeypatch):
-    monkeypatch.setattr(
-        settings,
-        "vonage_signature_secret",
-        "test-secret",
-    )
+    monkeypatch.setattr(settings, "vonage_signature_secret", "test-secret")
 
     params = {
         "messageId": "test-message-123",
         "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "api-invalid-test-nonce",
         "sig": "invalid-signature",
     }
 
     response = client.post(
         "/api/v1/webhooks/vonage/delivery-receipt",
         content=urlencode(params),
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded"
-        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
 
     assert response.status_code == 401
@@ -160,23 +160,19 @@ def test_webhook_rejects_duplicate_parameters(client, monkeypatch):
 
 
 def test_webhook_rejects_missing_signature(client, monkeypatch):
-    monkeypatch.setattr(
-        settings,
-        "vonage_signature_secret",
-        "test-secret",
-    )
+    monkeypatch.setattr(settings, "vonage_signature_secret", "test-secret")
 
     params = {
         "messageId": "test-message-123",
         "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "api-missing-signature-nonce",
     }
 
     response = client.post(
         "/api/v1/webhooks/vonage/delivery-receipt",
         content=urlencode(params),
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded"
-        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
 
     assert response.status_code == 401
