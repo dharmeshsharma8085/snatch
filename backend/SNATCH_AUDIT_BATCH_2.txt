@@ -1,0 +1,1766 @@
+
+
+========== app\services\auth_service.py ==========
+
+import os
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from dotenv import load_dotenv
+from pwdlib import PasswordHash
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+
+from app.database.database import SessionLocal
+from app.models.user import User
+from app.schemas.auth import (
+    UserRegister,
+    UserResponse,
+    UserLogin,
+    TokenResponse,
+)
+
+load_dotenv()
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(
+    os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
+)
+
+if not JWT_SECRET_KEY or len(JWT_SECRET_KEY) < 32:
+    raise RuntimeError(
+        "JWT_SECRET_KEY must contain at least 32 characters"
+    )
+
+password_hasher = PasswordHash.recommended()
+
+
+def hash_password(password: str) -> str:
+    return password_hasher.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return password_hasher.verify(password, password_hash)
+
+
+def create_access_token(user_id: str) -> str:
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+
+    payload = {
+        "sub": user_id,
+        "exp": expires_at,
+        "iat": now,
+    }
+
+    return jwt.encode(
+        payload,
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def register_user(data: UserRegister) -> UserResponse:
+    email = str(data.email).strip().lower()
+
+    with SessionLocal() as db:
+        existing_user = db.scalar(
+            select(User).where(User.email == email)
+        )
+
+        if existing_user:
+            raise ValueError("Email is already registered")
+
+        user = User(
+            email=email,
+            password_hash=hash_password(data.password),
+            is_active=True,
+        )
+
+        try:
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            return UserResponse(
+                user_id=user.user_id,
+                email=user.email,
+                is_active=user.is_active,
+            )
+
+        except IntegrityError:
+            db.rollback()
+            raise ValueError("Email is already registered")
+
+
+def login_user(data: UserLogin) -> TokenResponse:
+    email = str(data.email).strip().lower()
+
+    with SessionLocal() as db:
+        user = db.scalar(
+            select(User).where(User.email == email)
+        )
+
+        if not user or not verify_password(
+            data.password, user.password_hash
+        ):
+            raise ValueError("Invalid email or password")
+
+        if not user.is_active:
+            raise ValueError("Account is inactive")
+
+        token = create_access_token(user.user_id)
+
+        return TokenResponse(
+            access_token=token,
+            token_type="bearer",
+            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        )
+
+
+========== app\services\vonage_sms_provider.py ==========
+import logging
+
+from vonage import Auth, Vonage
+from vonage_sms import SmsMessage
+
+from app.services.sms_provider import SMSResult
+
+logger = logging.getLogger(__name__)
+
+
+class VonageSMSProvider:
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        sender_id: str,
+    ):
+        self.client = Vonage(
+            Auth(
+                api_key=api_key,
+                api_secret=api_secret,
+            )
+        )
+        self.sender_id = sender_id
+    def build_message(
+        self,
+        phone_number: str,
+        message: str,
+    ) -> SmsMessage:
+        if not phone_number.strip():
+            raise ValueError("Phone number cannot be empty.")
+
+        if not message.strip():
+            raise ValueError("Message cannot be empty.")
+
+        return SmsMessage(
+            to=phone_number,
+            from_=self.sender_id,
+            text=message,
+        )
+    
+    
+
+    def send_sms(
+        self,
+        phone_number: str,
+        message: str,
+    ) -> SMSResult:
+
+        # Validation happens before contacting Vonage.
+        try:
+            sms = self.build_message(phone_number, message)
+        except ValueError as error:
+            return SMSResult(
+                success=False,
+                error=str(error),
+            )
+
+        # Once the network request starts, an exception
+        # may mean Vonage accepted the SMS but the response
+        # was lost. Treat it as an unknown outcome.
+        try:
+            response = self.client.sms.send(sms)
+        except Exception as error:
+            logger.error(
+                "Vonage request outcome unknown. Exception type: %s",
+                type(error).__name__,
+            )
+            return SMSResult(
+                success=False,
+                error="Vonage request outcome is unknown. Manual reconciliation required.",
+                outcome_unknown=True,
+            )
+
+        try:
+            response_data = response.model_dump(exclude_unset=True)
+            messages = response_data.get("messages", [])
+
+            if not messages:
+                return SMSResult(
+                    success=False,
+                    error="Vonage returned an empty response. Outcome unknown.",
+                    outcome_unknown=True,
+                )
+
+            result = messages[0]
+
+            if str(result.get("status")) == "0":
+                message_id = result.get("message_id")
+
+                if not message_id:
+                    return SMSResult(
+                        success=False,
+                        error="Vonage accepted the request without a message ID.",
+                        outcome_unknown=True,
+                    )
+
+                return SMSResult(
+                    success=True,
+                    provider_message_id=message_id,
+                )
+
+            return SMSResult(
+                success=False,
+                error=result.get(
+                    "error_text",
+                    "Vonage rejected the SMS request.",
+                ),
+            )
+
+        except Exception as error:
+            logger.error(
+                "Vonage response could not be processed. Exception type: %s",
+                type(error).__name__,
+            )
+            return SMSResult(
+                success=False,
+                error="Vonage response could not be verified. Outcome unknown.",
+                outcome_unknown=True,
+            )
+
+
+========== app\services\sms_provider.py ==========
+
+from dataclasses import dataclass
+from typing import Protocol
+
+
+@dataclass
+class SMSResult:
+    success: bool
+    provider_message_id: str | None = None
+    error: str | None = None
+    outcome_unknown: bool = False
+
+class SMSProvider(Protocol):
+    def send_sms(self, phone_number: str, message: str) -> SMSResult:
+        ...
+
+
+class DisabledSMSProvider:
+    def send_sms(self, phone_number: str, message: str) -> SMSResult:
+        return SMSResult(
+            success=False,
+            error="SMS sending is disabled. No SMS was sent.",
+        )
+
+
+def get_sms_provider():
+    from app.core.config import settings
+
+    if not settings.sms_live_enabled:
+        return DisabledSMSProvider()
+
+    if not (
+        settings.vonage_api_key
+        and settings.vonage_api_secret
+        and settings.vonage_sender_id
+    ):
+        return DisabledSMSProvider()
+
+    from app.services.vonage_sms_provider import VonageSMSProvider
+
+    return VonageSMSProvider(
+        api_key=settings.vonage_api_key,
+        api_secret=settings.vonage_api_secret,
+        sender_id=settings.vonage_sender_id,
+    )
+
+
+========== app\services\notification_status_service.py ==========
+from uuid import UUID
+
+from sqlalchemy import select
+
+from app.database.database import SessionLocal
+from app.models.emergency import Emergency
+from app.models.notification import NotificationDelivery
+from app.schemas.notification import (
+    EmergencyNotificationStatusResponse,
+    NotificationDeliveryItem,
+)
+
+
+def get_emergency_notification_status(
+    emergency_id: UUID,
+    user_id: UUID,
+):
+    with SessionLocal() as db:
+
+        emergency = db.scalar(
+            select(Emergency).where(
+                Emergency.emergency_id == str(emergency_id),
+                Emergency.user_id == str(user_id),
+            )
+        )
+
+        if emergency is None:
+            raise PermissionError("Emergency record not found.")
+
+        deliveries = db.scalars(
+            select(NotificationDelivery)
+            .where(
+                NotificationDelivery.emergency_id
+                == str(emergency_id)
+            )
+            .order_by(NotificationDelivery.created_at.asc())
+        ).all()
+
+        notifications = [
+            NotificationDeliveryItem.model_validate(item)
+            for item in deliveries
+        ]
+
+        messages = {
+            "not_started": "Notification delivery has not started.",
+            "ready": "Emergency approved and ready for queueing.",
+            "queued": "Notifications are queued or awaiting retry.",
+            "sent": "Notifications have been sent.",
+            "partially_failed": "Some notifications failed.",
+            "failed": "All notification delivery attempts failed.",
+        }
+
+        return EmergencyNotificationStatusResponse(
+            emergency_id=emergency.emergency_id,
+            delivery_status=emergency.delivery_status,
+            recipient_count=emergency.recipient_count,
+            notifications=notifications,
+            message=messages.get(
+                emergency.delivery_status,
+                "Notification status retrieved.",
+            ),
+        )
+
+
+========== app\schemas\emergency.py ==========
+
+from datetime import datetime
+from typing import Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+
+class EmergencyRequest(BaseModel):
+    incident_id: UUID
+    device_id: UUID
+
+    trigger_reason: str = Field(
+        min_length=3,
+        max_length=500
+    )
+
+    trusted_contact_ids: list[UUID] = Field(
+        default_factory=list,
+        max_length=10
+    )
+
+
+class EmergencyApprovalRequest(BaseModel):
+    owner_confirmed: bool
+
+
+class EmergencyResponse(BaseModel):
+    emergency_id: UUID 
+    
+
+    incident_id: UUID
+    device_id: UUID
+
+    trigger_reason: str
+
+    trusted_contact_ids: list[UUID] = Field(
+        default_factory=list
+    )
+
+    status: Literal[
+        "pending_owner_approval",
+        "approved_pending_delivery",
+        "cancelled"
+    ]
+
+    owner_approved: bool
+
+    delivery_status: Literal[
+        "not_started",
+        "ready",
+        "queued",
+        "sent",
+        "partially_failed",
+        "failed",
+        "delivery_unknown",
+    ]
+    recipient_count: int
+    attempt_count: int
+
+    message: str
+
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+========== app\schemas\notification.py ==========
+from datetime import datetime
+from typing import Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+
+
+class NotificationDeliveryItem(BaseModel):
+    delivery_id: UUID
+    contact_id: UUID
+    channel: str
+    status: Literal[
+        "queued",
+        "processing",
+        "submitted",
+        "sent",
+        "failed",
+        "delivery_unknown",
+    ]
+
+    attempt_count: int = Field(ge=0)
+    next_attempt_at: datetime | None = None
+    last_error: str | None = None
+
+    provider_message_id: str | None = None
+    provider_status: str | None = None
+    delivered_at: datetime | None = None
+
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class EmergencyNotificationStatusResponse(BaseModel):
+    emergency_id: UUID
+
+    delivery_status: Literal[
+        "not_started",
+        "ready",
+        "queued",
+        "sent",
+        "partially_failed",
+        "failed",
+        "delivery_unknown",
+    ]
+
+    recipient_count: int = Field(ge=0)
+    notifications: list[NotificationDeliveryItem]
+
+    message: str
+    
+    
+class NotificationQueueResponse(BaseModel):
+    emergency_id: UUID
+    delivery_status: Literal["queued"]
+    recipient_count: int = Field(ge=0)
+    queued_count: int = Field(ge=0)
+    message: str
+
+
+========== app\main.py ==========
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Depends
+from uuid import UUID
+
+from app.core.security import get_current_user
+from app.models.user import User
+from app.services.device_service import get_device
+
+from app.api.location import router as location_router
+from app.api.evidence import router as evidence_router
+from app.api.emergency import router as emergency_router
+from app.api.battery import router as battery_router
+from app.api.workflow import router as workflow_router
+from app.api.incidents import router as incidents_router
+from app.api.devices import router as devices_router
+from app.api.auth import router as auth_router
+
+from app.core.config import settings
+
+from app.schemas.events import (
+    DeviceEvent,
+    AnalysisResponse,
+    RiskAssessmentResponse
+)
+
+from app.graph.workflow import snatch_graph
+from app.workers.device_monitor import device_monitor_loop
+from app.api.trusted_contacts import router as trusted_contacts_router
+from app.api.notifications import router as notifications_router
+from app.api.vonage_webhook import router as vonage_webhook_router
+from app.workers.notification_runner import notification_worker_loop
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    # Start background device monitoring
+    monitor_task = asyncio.create_task(
+        device_monitor_loop()
+    )
+
+    logger.info("SNATCH Device Monitor Started")
+
+    # Start notification worker
+    notification_stop_event = asyncio.Event()
+
+    notification_task = asyncio.create_task(
+        notification_worker_loop(
+            notification_stop_event,
+            poll_interval_seconds=15,
+        )
+    )
+
+    logger.info("SNATCH Notification Worker Started")
+
+    try:
+        yield
+
+    finally:
+        # Stop notification worker gracefully
+        notification_stop_event.set()
+
+        try:
+            await notification_task
+        except asyncio.CancelledError:
+            logger.info("SNATCH Notification Worker Stopped")
+
+        # Stop device monitoring
+        monitor_task.cancel()
+
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            logger.info("SNATCH Device Monitor Stopped")
+
+app = FastAPI(
+    title=settings.app_name,
+    description=(
+        "Agentic smartphone protection "
+        "and emergency response platform"
+    ),
+    version="0.1.0",
+    lifespan=lifespan
+)
+
+
+# Register API routers
+# Register API routers
+app.include_router(evidence_router)
+app.include_router(emergency_router)
+app.include_router(battery_router)
+app.include_router(workflow_router)
+app.include_router(incidents_router)
+app.include_router(auth_router)
+app.include_router(devices_router)
+app.include_router(location_router)
+app.include_router(trusted_contacts_router)
+app.include_router(notifications_router)
+
+app.include_router(vonage_webhook_router)
+
+@app.get("/")
+async def root():
+
+    return {
+        "application": "SNATCH",
+        "message": "Device protection system is running",
+        "status": "operational"
+    }
+
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "healthy",
+        "service": "SNATCH Backend"
+    }
+
+
+@app.post(
+    "/api/v1/analyze",
+    response_model=AnalysisResponse
+)
+async def analyze_device_event(
+    event: DeviceEvent,
+    current_user: User = Depends(get_current_user),
+):
+    # 1. Verify device ownership and active status.
+    authenticated_user_id = UUID(str(current_user.user_id))
+
+    device = get_device(
+        device_id=event.device_id,
+        user_id=authenticated_user_id,
+    )
+
+    if device is None or not device.is_active:
+        raise HTTPException(
+            status_code=404,
+            detail="Active device not found",
+        )
+
+    # 2. Verify registered platform.
+    if device.platform != event.platform:
+        raise HTTPException(
+            status_code=409,
+            detail="Device platform mismatch",
+        )
+
+    # 3. Never trust user_id from request body.
+    event_data = event.model_dump(mode="json")
+    event_data["user_id"] = str(authenticated_user_id)
+
+    try:
+        initial_state = {
+            "event": event_data,
+            "agent_trace": [],
+            "errors": [],
+        }
+
+        result = await snatch_graph.ainvoke(initial_state)
+
+        assessment = result["risk_assessment"]
+
+        return AnalysisResponse(
+            event_id=event.event_id,
+            risk_assessment=RiskAssessmentResponse(
+                score=assessment["score"],
+                level=assessment["level"],
+                confidence=assessment["confidence"],
+                signals=assessment["signals"],
+                explanation=result["explanation"],
+                recommended_action=assessment["recommended_action"],
+            ),
+            next_action=result["next_action"],
+            agent_trace=result["agent_trace"],
+            openai_used=result.get("openai_used", False),
+        )
+
+    except Exception as error:
+        logger.exception("Legacy analysis workflow failed")
+
+        raise HTTPException(
+            status_code=500,
+            detail="SNATCH workflow execution failed",
+        ) from error
+
+
+========== app\workers\device_monitor.py ==========
+import asyncio
+import logging
+
+from app.services.device_service import mark_stale_devices_offline
+
+logger = logging.getLogger(__name__)
+
+
+async def device_monitor_loop():
+    while True:
+        try:
+            count = await asyncio.to_thread(
+                mark_stale_devices_offline,
+                5
+            )
+
+            if count > 0:
+                logger.info(
+                    "Marked %s stale devices as offline",
+                    count
+                )
+
+        except Exception:
+            logger.exception("Device monitoring cycle failed")
+
+        await asyncio.sleep(60)
+
+
+========== tests\test_notification_worker.py ==========
+from datetime import datetime, timezone, timedelta
+from uuid import uuid4
+
+from app.models.user import User
+from app.models.device import Device
+from app.models.incident import Incident
+from app.models.emergency import Emergency
+from app.models.trusted_contact import TrustedContact
+from app.models.notification import NotificationDelivery
+
+from app.services.sms_provider import SMSResult
+from app.workers import notification_worker
+
+
+class FakeSMSProvider:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def send_sms(self, phone_number, message):
+        self.calls.append((phone_number, message))
+        return self.result
+
+
+def create_notification_data(
+    test_db,
+    monkeypatch,
+    approved=True,
+    contact_active=True,
+    attempt_count=0,
+):
+    monkeypatch.setattr(
+        notification_worker,
+        "SessionLocal",
+        test_db,
+    )
+
+    monkeypatch.setattr(
+        notification_worker.settings,
+        "sms_live_enabled",
+        True,
+    )
+
+    user_id = str(uuid4())
+    device_id = str(uuid4())
+    incident_id = str(uuid4())
+    emergency_id = str(uuid4())
+    contact_id = str(uuid4())
+    delivery_id = str(uuid4())
+
+    with test_db() as db:
+        user = User(
+            user_id=user_id,
+            email=f"{user_id}@test.com",
+            password_hash="test-hash",
+            is_active=True,
+        )
+
+        device = Device(
+            device_id=device_id,
+            user_id=user_id,
+            device_name="Worker Test Device",
+            platform="android",
+            is_active=True,
+        )
+
+        incident = Incident(
+            incident_id=incident_id,
+            user_id=user_id,
+            device_id=device_id,
+            risk_score=80,
+            risk_level="high",
+            trigger_reason="Simulated test incident",
+            signals=["unusual_motion"],
+            status="awaiting_owner_verification",
+        )
+
+        contact = TrustedContact(
+            contact_id=contact_id,
+            user_id=user_id,
+            name="Test Contact",
+            phone_number="+919876543210",
+            is_active=contact_active,
+        )
+
+        emergency = Emergency(
+            emergency_id=emergency_id,
+            user_id=user_id,
+            incident_id=incident_id,
+            device_id=device_id,
+            trigger_reason="Simulated emergency",
+            trusted_contact_ids=[contact_id],
+            owner_approved=approved,
+            status=(
+                "approved_pending_delivery"
+                if approved
+                else "pending_owner_approval"
+            ),
+            delivery_status="queued" if approved else "ready",
+            recipient_count=1,
+            attempt_count=0,
+        )
+
+        notification = NotificationDelivery(
+            delivery_id=delivery_id,
+            emergency_id=emergency_id,
+            contact_id=contact_id,
+            channel="sms",
+            status="queued",
+            attempt_count=attempt_count,
+        )
+
+        db.add_all([
+            user,
+            device,
+            incident,
+            contact,
+            emergency,
+            notification,
+        ])
+        db.commit()
+
+    return delivery_id, emergency_id
+
+
+def test_worker_skips_when_sms_disabled(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        notification_worker.settings,
+        "sms_live_enabled",
+        False,
+    )
+
+    result = notification_worker.process_notification_queue()
+
+    assert result["skipped"] is True
+    assert result["processed_count"] == 0
+
+
+def test_worker_successful_submission(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, emergency_id = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    fake_provider = FakeSMSProvider(
+        SMSResult(
+            success=True,
+            provider_message_id="fake-vonage-message-001",
+        )
+    )
+
+    monkeypatch.setattr(
+        notification_worker,
+        "get_sms_provider",
+        lambda: fake_provider,
+    )
+
+    result = notification_worker.process_notification_queue()
+
+    assert result["processed_count"] == 1
+    assert result["sent_count"] == 1
+    assert len(fake_provider.calls) == 1
+
+    with test_db() as db:
+        saved = db.get(NotificationDelivery, delivery_id)
+        emergency = db.get(Emergency, emergency_id)
+
+        assert saved.status == "submitted"
+        assert saved.provider_status == "accepted"
+        assert saved.provider_message_id == "fake-vonage-message-001"
+        assert saved.attempt_count == 1
+
+        # Provider acceptance is not confirmed delivery.
+        assert emergency.delivery_status == "queued"
+
+
+def test_worker_does_not_send_without_owner_approval(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+        approved=False,
+    )
+
+    fake_provider = FakeSMSProvider(
+        SMSResult(success=True, provider_message_id="fake-id")
+    )
+
+    monkeypatch.setattr(
+        notification_worker,
+        "get_sms_provider",
+        lambda: fake_provider,
+    )
+
+    result = notification_worker.process_notification_queue()
+
+    assert result["processed_count"] == 0
+    assert fake_provider.calls == []
+
+    with test_db() as db:
+        saved = db.get(NotificationDelivery, delivery_id)
+        assert saved.status == "failed"
+        assert saved.last_error is not None
+        assert saved.attempt_count == 0
+
+
+def test_worker_schedules_retry_after_failure(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    fake_provider = FakeSMSProvider(
+        SMSResult(
+            success=False,
+            error="Simulated provider failure",
+        )
+    )
+
+    monkeypatch.setattr(
+        notification_worker,
+        "get_sms_provider",
+        lambda: fake_provider,
+    )
+
+    result = notification_worker.process_notification_queue()
+
+    assert result["processed_count"] == 1
+    assert result["failed_count"] == 0
+
+    with test_db() as db:
+        saved = db.get(NotificationDelivery, delivery_id)
+
+        assert saved.status == "queued"
+        assert saved.attempt_count == 1
+        assert saved.next_attempt_at is not None
+        assert saved.last_error == "Simulated provider failure"
+
+
+def test_worker_marks_failed_after_max_attempts(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+        attempt_count=2,
+    )
+
+    fake_provider = FakeSMSProvider(
+        SMSResult(
+            success=False,
+            error="Simulated final failure",
+        )
+    )
+
+    monkeypatch.setattr(
+        notification_worker,
+        "get_sms_provider",
+        lambda: fake_provider,
+    )
+
+    result = notification_worker.process_notification_queue()
+
+    assert result["processed_count"] == 1
+    assert result["failed_count"] == 1
+
+    with test_db() as db:
+        saved = db.get(NotificationDelivery, delivery_id)
+
+        assert saved.status == "failed"
+        assert saved.attempt_count == 3
+        assert saved.next_attempt_at is None
+
+
+def test_worker_rejects_inactive_contact(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, emergency_id = create_notification_data(
+        test_db,
+        monkeypatch,
+        contact_active=False,
+    )
+
+    fake_provider = FakeSMSProvider(
+        SMSResult(success=True, provider_message_id="fake-id")
+    )
+
+    monkeypatch.setattr(
+        notification_worker,
+        "get_sms_provider",
+        lambda: fake_provider,
+    )
+
+    result = notification_worker.process_notification_queue()
+
+    assert result["processed_count"] == 1
+    assert result["failed_count"] == 1
+    assert fake_provider.calls == []
+
+    with test_db() as db:
+        saved = db.get(NotificationDelivery, delivery_id)
+        emergency = db.get(Emergency, emergency_id)
+
+        assert saved.status == "failed"
+        assert "Recipient validation failed" in saved.last_error
+        assert emergency.delivery_status == "failed"
+
+def test_claim_notifications_sets_processing_and_lease(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    claimed_ids = notification_worker.claim_notifications()
+
+    assert delivery_id in claimed_ids
+
+    with test_db() as db:
+        saved = db.get(NotificationDelivery, delivery_id)
+
+        assert saved.status == "processing"
+        assert saved.claimed_by is not None
+        assert saved.claimed_at is not None
+        assert saved.claim_expires_at is not None
+
+
+def test_claim_notifications_does_not_claim_same_job_twice(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    first_claim = notification_worker.claim_notifications()
+    second_claim = notification_worker.claim_notifications()
+
+    assert delivery_id in first_claim
+    assert delivery_id not in second_claim
+
+
+def test_claim_notifications_only_claims_eligible_jobs(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    with test_db() as db:
+        notification = db.get(NotificationDelivery, delivery_id)
+        notification.next_attempt_at = (
+            datetime.now(timezone.utc)
+            + timedelta(minutes=10)
+        )
+        db.commit()
+
+    claimed_ids = notification_worker.claim_notifications()
+
+    assert delivery_id not in claimed_ids
+
+
+
+
+def test_expired_claim_becomes_delivery_unknown(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, emergency_id = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    with test_db() as db:
+        notification = db.get(NotificationDelivery, delivery_id)
+        notification.status = "processing"
+        notification.claimed_by = "crashed-worker"
+        notification.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        notification.claim_expires_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        db.commit()
+
+    recovered = notification_worker.recover_expired_claims()
+
+    assert recovered == 1
+
+    with test_db() as db:
+        notification = db.get(NotificationDelivery, delivery_id)
+        emergency = db.get(Emergency, emergency_id)
+
+        assert notification.status == "delivery_unknown"
+        assert notification.claimed_by is None
+        assert notification.claim_expires_at is None
+        assert emergency.delivery_status == "delivery_unknown"
+
+
+def test_unknown_provider_outcome_is_not_retried(
+    test_db,
+    monkeypatch,
+):
+    delivery_id, _ = create_notification_data(
+        test_db,
+        monkeypatch,
+    )
+
+    fake_provider = FakeSMSProvider(
+        SMSResult(
+            success=False,
+            error="Network outcome unknown",
+            outcome_unknown=True,
+        )
+    )
+
+    monkeypatch.setattr(
+        notification_worker,
+        "get_sms_provider",
+        lambda: fake_provider,
+    )
+
+    first_result = notification_worker.process_notification_queue()
+
+    assert first_result["unknown_count"] == 1
+    assert len(fake_provider.calls) == 1
+
+    second_result = notification_worker.process_notification_queue()
+
+    assert second_result["processed_count"] == 0
+    assert len(fake_provider.calls) == 1
+
+    with test_db() as db:
+        notification = db.get(NotificationDelivery, delivery_id)
+
+        assert notification.status == "delivery_unknown"
+        assert notification.next_attempt_at is None
+
+
+========== tests\test_delivery_receipt_service.py ==========
+
+import pytest
+
+from app.models.notification import NotificationDelivery
+from app.services.delivery_receipt_service import (
+    process_delivery_receipt,
+)
+
+
+def test_delivery_receipt_unknown_message(test_db, monkeypatch):
+    from app.services import delivery_receipt_service
+
+    monkeypatch.setattr(
+        delivery_receipt_service,
+        "SessionLocal",
+        test_db,
+    )
+
+    result = process_delivery_receipt(
+        message_id="unknown-message",
+        status="delivered",
+    )
+
+    assert result["updated"] is False
+    assert result["message"] == "Notification not found."
+
+
+def test_invalid_delivery_status():
+    with pytest.raises(ValueError):
+        process_delivery_receipt(
+            message_id="test-message",
+            status="unknown",
+        )
+
+
+def test_delivered_receipt(test_db, monkeypatch):
+    from app.services import delivery_receipt_service
+
+    monkeypatch.setattr(
+        delivery_receipt_service,
+        "SessionLocal",
+        test_db,
+    )
+
+    message_id = "vonage-test-delivered"
+
+    with test_db() as db:
+        notification = NotificationDelivery(
+            emergency_id="missing-emergency",
+            contact_id="missing-contact",
+            channel="sms",
+            status="submitted",
+            provider_message_id=message_id,
+            provider_status="accepted",
+        )
+        db.add(notification)
+        db.commit()
+
+    result = process_delivery_receipt(
+        message_id=message_id,
+        status="delivered",
+    )
+
+    assert result["updated"] is True
+    assert result["delivery_status"] == "sent"
+    assert result["provider_status"] == "delivered"
+
+    with test_db() as db:
+        saved = db.query(NotificationDelivery).filter_by(
+            provider_message_id=message_id
+        ).first()
+
+        assert saved.status == "sent"
+        assert saved.delivered_at is not None
+
+
+def test_failed_receipt(test_db, monkeypatch):
+    from app.services import delivery_receipt_service
+
+    monkeypatch.setattr(
+        delivery_receipt_service,
+        "SessionLocal",
+        test_db,
+    )
+
+    message_id = "vonage-test-failed"
+
+    with test_db() as db:
+        notification = NotificationDelivery(
+            emergency_id="missing-emergency",
+            contact_id="missing-contact",
+            channel="sms",
+            status="submitted",
+            provider_message_id=message_id,
+        )
+        db.add(notification)
+        db.commit()
+
+    result = process_delivery_receipt(
+        message_id=message_id,
+        status="failed",
+    )
+
+    assert result["updated"] is True
+    assert result["delivery_status"] == "failed"
+
+    with test_db() as db:
+        saved = db.query(NotificationDelivery).filter_by(
+            provider_message_id=message_id
+        ).first()
+
+        assert saved.status == "failed"
+        assert saved.delivered_at is None
+
+
+
+def test_duplicate_delivery_receipt(test_db, monkeypatch):
+    from app.services import delivery_receipt_service
+
+    monkeypatch.setattr(
+        delivery_receipt_service,
+        "SessionLocal",
+        test_db,
+    )
+
+    message_id = "vonage-duplicate-test"
+
+    with test_db() as db:
+        db.add(
+            NotificationDelivery(
+                emergency_id="missing-emergency",
+                contact_id="missing-contact",
+                channel="sms",
+                status="submitted",
+                provider_message_id=message_id,
+            )
+        )
+        db.commit()
+
+    first = process_delivery_receipt(
+        message_id=message_id,
+        status="delivered",
+    )
+
+    second = process_delivery_receipt(
+        message_id=message_id,
+        status="delivered",
+    )
+
+    assert first["updated"] is True
+    assert second["updated"] is False
+
+
+========== tests\test_vonage_webhook.py ==========
+from unittest.mock import patch
+import hashlib
+import hmac
+import time
+from app.api.vonage_webhook import verify_sms_signature
+from fastapi.testclient import TestClient
+
+import pytest
+from app.main import app
+from app.core.config import settings
+@pytest.fixture
+def client():
+    return TestClient(app)
+
+def generate_test_signature(params, secret):
+    signing_params = {
+        key: value.replace("&", "_").replace("=", "_")
+        for key, value in params.items()
+        if key != "sig"
+    }
+
+    signing_string = "".join(
+        f"&{key}={signing_params[key]}"
+        for key in sorted(signing_params)
+    )
+
+    return hmac.new(
+        secret.encode(),
+        signing_string.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def test_valid_signature():
+    secret = "test-secret"
+    params = {
+        "messageId": "test-message-123",
+        "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "valid-test-nonce-123",
+    }
+    params["sig"] = generate_test_signature(params, secret)
+
+    assert verify_sms_signature(params, secret) is True
+
+
+def test_invalid_signature():
+    params = {
+        "messageId": "test-message-123",
+        "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "invalid-test-nonce-123",
+        "sig": "invalid-signature",
+    }
+    assert verify_sms_signature(params, "test-secret") is False
+
+
+def test_tampered_payload_rejected():
+    secret = "test-secret"
+    params = {
+        "messageId": "test-message-123",
+        "status": "delivered",
+    }
+
+    params["sig"] = generate_test_signature(params, secret)
+    params["status"] = "failed"
+
+    assert verify_sms_signature(params, secret) is False
+
+
+def test_missing_signature_rejected():
+    params = {
+        "messageId": "test-message-123",
+        "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "missing-signature-test-nonce",
+    }
+    assert verify_sms_signature(params, "test-secret") is False
+
+
+
+from urllib.parse import urlencode
+
+
+def test_webhook_accepts_valid_signature(client, monkeypatch):
+    secret = "test-secret"
+    monkeypatch.setattr(settings, "vonage_signature_secret", secret)
+
+    params = {
+        "messageId": "test-message-123",
+        "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "api-valid-test-nonce",
+    }
+    params["sig"] = generate_test_signature(params, secret)
+
+    with (
+        patch("app.api.vonage_webhook.process_delivery_receipt") as mock_receipt,
+        patch(
+            "app.services.webhook_replay_service.register_webhook_nonce",
+            return_value=True,
+        ) as mock_nonce,
+    ):
+        mock_receipt.return_value = {"updated": True}
+
+        response = client.post(
+            "/api/v1/webhooks/vonage/delivery-receipt",
+            content=urlencode(params),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["updated"] is True
+    mock_receipt.assert_called_once_with(
+        message_id="test-message-123",
+        status="delivered",
+    )
+    mock_nonce.assert_called_once()
+
+
+def test_webhook_rejects_invalid_signature(client, monkeypatch):
+    monkeypatch.setattr(settings, "vonage_signature_secret", "test-secret")
+
+    params = {
+        "messageId": "test-message-123",
+        "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "api-invalid-test-nonce",
+        "sig": "invalid-signature",
+    }
+
+    response = client.post(
+        "/api/v1/webhooks/vonage/delivery-receipt",
+        content=urlencode(params),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_webhook_rejects_duplicate_parameters(client, monkeypatch):
+    monkeypatch.setattr(
+        settings,
+        "vonage_signature_secret",
+        "test-secret",
+    )
+
+    response = client.post(
+        "/api/v1/webhooks/vonage/delivery-receipt",
+        content=(
+            "messageId=one&messageId=two"
+            "&status=delivered&sig=invalid"
+        ),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+    )
+
+    assert response.status_code == 400
+
+
+def test_webhook_rejects_missing_signature(client, monkeypatch):
+    monkeypatch.setattr(settings, "vonage_signature_secret", "test-secret")
+
+    params = {
+        "messageId": "test-message-123",
+        "status": "delivered",
+        "timestamp": str(int(time.time())),
+        "nonce": "api-missing-signature-nonce",
+    }
+
+    response = client.post(
+        "/api/v1/webhooks/vonage/delivery-receipt",
+        content=urlencode(params),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 401
+
+
+========== tests\test_webhook_replay_service.py ==========
+
+import time
+
+from app.models.webhook_nonce import WebhookNonce
+from app.services import webhook_replay_service
+
+
+def test_valid_webhook_nonce_accepted(test_db, monkeypatch):
+    monkeypatch.setattr(
+        webhook_replay_service,
+        "SessionLocal",
+        test_db,
+    )
+
+    timestamp = str(int(time.time()))
+
+    result = webhook_replay_service.register_webhook_nonce(
+        timestamp=timestamp,
+        nonce="fresh-nonce-001",
+    )
+
+    assert result is True
+
+
+def test_duplicate_nonce_rejected(test_db, monkeypatch):
+    monkeypatch.setattr(
+        webhook_replay_service,
+        "SessionLocal",
+        test_db,
+    )
+
+    timestamp = str(int(time.time()))
+    nonce = "duplicate-nonce-001"
+
+    first = webhook_replay_service.register_webhook_nonce(
+        timestamp=timestamp,
+        nonce=nonce,
+    )
+    second = webhook_replay_service.register_webhook_nonce(
+        timestamp=timestamp,
+        nonce=nonce,
+    )
+
+    assert first is True
+    assert second is False
+
+
+def test_expired_timestamp_rejected(test_db, monkeypatch):
+    monkeypatch.setattr(
+        webhook_replay_service,
+        "SessionLocal",
+        test_db,
+    )
+
+    old_timestamp = str(int(time.time()) - 600)
+
+    result = webhook_replay_service.register_webhook_nonce(
+        timestamp=old_timestamp,
+        nonce="expired-nonce-001",
+    )
+
+    assert result is False
+
+
+def test_invalid_timestamp_rejected(test_db, monkeypatch):
+    monkeypatch.setattr(
+        webhook_replay_service,
+        "SessionLocal",
+        test_db,
+    )
+
+    result = webhook_replay_service.register_webhook_nonce(
+        timestamp="invalid-timestamp",
+        nonce="invalid-nonce-001",
+    )
+
+    assert result is False
+
+
+def test_missing_nonce_rejected(test_db, monkeypatch):
+    monkeypatch.setattr(
+        webhook_replay_service,
+        "SessionLocal",
+        test_db,
+    )
+
+    result = webhook_replay_service.register_webhook_nonce(
+        timestamp=str(int(time.time())),
+        nonce="",
+    )
+
+    assert result is False
+
+
+========== tests\test_emergency_authorization.py ==========
+
+from uuid import uuid4
+
+import pytest
+
+from app.models.user import User
+from app.models.device import Device
+from app.models.incident import Incident
+from app.models.trusted_contact import TrustedContact
+from app.schemas.emergency import EmergencyRequest
+from app.services import emergency_service
+
+
+def seed_owner(db, label):
+    user_id = uuid4()
+    device_id = uuid4()
+    incident_id = uuid4()
+    contact_id = uuid4()
+
+    user = User(
+        user_id=str(user_id),
+        email=f"{label}-{user_id}@test.com",
+        password_hash="test-hash",
+        is_active=True,
+    )
+
+    device = Device(
+        device_id=str(device_id),
+        user_id=str(user_id),
+        device_name=f"{label} Android",
+        platform="android",
+        is_active=True,
+    )
+
+    incident = Incident(
+        incident_id=str(incident_id),
+        user_id=str(user_id),
+        device_id=str(device_id),
+        risk_score=75,
+        risk_level="high",
+        trigger_reason="Multiple suspicious signals",
+        signals=["unusual_motion"],
+        status="awaiting_owner_verification",
+    )
+
+    contact = TrustedContact(
+        contact_id=str(contact_id),
+        user_id=str(user_id),
+        name=f"{label} Contact",
+        phone_number=f"+919876543210",
+        is_active=True,
+    )
+
+    db.add_all([user, device, incident, contact])
+    db.commit()
+
+    return {
+        "user_id": user_id,
+        "device_id": device_id,
+        "incident_id": incident_id,
+        "contact_id": contact_id,
+    }
+
+
+def make_request(owner):
+    return EmergencyRequest(
+        incident_id=owner["incident_id"],
+        device_id=owner["device_id"],
+        trigger_reason="Suspicious device activity",
+        trusted_contact_ids=[owner["contact_id"]],
+        owner_approved=False,
+    )
+
+
+def test_user_cannot_use_another_users_incident(test_db, monkeypatch):
+    monkeypatch.setattr(emergency_service, "SessionLocal", test_db)
+
+    with test_db() as db:
+        user_a = seed_owner(db, "user-a")
+        user_b = seed_owner(db, "user-b")
+
+    request = make_request(user_b)
+
+    with pytest.raises(PermissionError):
+        emergency_service.process_emergency(
+            request,
+            user_a["user_id"],
+        )
+
+
+def test_user_cannot_use_another_users_device(test_db, monkeypatch):
+    monkeypatch.setattr(emergency_service, "SessionLocal", test_db)
+
+    with test_db() as db:
+        user_a = seed_owner(db, "user-a")
+        user_b = seed_owner(db, "user-b")
+
+        incident_a = db.get(
+            Incident,
+            str(user_a["incident_id"]),
+        )
+        incident_a.device_id = str(user_b["device_id"])
+        db.commit()
+
+    request = make_request(user_a)
+    request.device_id = user_b["device_id"]
+
+    with pytest.raises(PermissionError):
+        emergency_service.process_emergency(
+            request,
+            user_a["user_id"],
+        )
+
+
+def test_user_cannot_add_another_users_trusted_contact(
+    test_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(emergency_service, "SessionLocal", test_db)
+
+    with test_db() as db:
+        user_a = seed_owner(db, "user-a")
+        user_b = seed_owner(db, "user-b")
+
+    request = make_request(user_a)
+    request.trusted_contact_ids = [user_b["contact_id"]]
+
+    with pytest.raises(PermissionError):
+        emergency_service.process_emergency(
+            request,
+            user_a["user_id"],
+        )
+
+
+def test_user_cannot_approve_another_users_emergency(
+    test_db,
+    monkeypatch,
+):
+    monkeypatch.setattr(emergency_service, "SessionLocal", test_db)
+
+    with test_db() as db:
+        user_a = seed_owner(db, "user-a")
+        user_b = seed_owner(db, "user-b")
+
+    emergency = emergency_service.process_emergency(
+        make_request(user_b),
+        user_b["user_id"],
+    )
+
+    with pytest.raises(PermissionError):
+        emergency_service.approve_emergency(
+            emergency_id=emergency.emergency_id,
+            user_id=user_a["user_id"],
+            owner_confirmed=True,
+        )
+
+def test_duplicate_active_emergency_rejected(test_db, monkeypatch):
+    monkeypatch.setattr(emergency_service, "SessionLocal", test_db)
+
+    with test_db() as db:
+        user = seed_owner(db, "duplicate-test")
+
+    request = make_request(user)
+
+    first = emergency_service.process_emergency(
+        request, user["user_id"]
+    )
+
+    with pytest.raises(ValueError, match="already exists"):
+        emergency_service.process_emergency(
+            request, user["user_id"]
+        )
